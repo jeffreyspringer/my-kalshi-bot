@@ -1,6 +1,7 @@
 import os
 import uuid
 import requests
+import time
 import kalshi_python
 from kalshi_python.models import *
 
@@ -9,46 +10,90 @@ from kalshi_python.models import *
 NOLA_LAT, NOLA_LON = 30.05, -90.03
 SERIES_TICKER = "KXHIGHTNOLA"
 
-# RISK MANAGEMENT
-MIN_BALANCE_CENTS = 500   # Stop trading if balance < $5.00
-MAX_TOTAL_POS = 20        # Max contracts to hold per market (Stop-loss/Risk limit)
+# RISK & STRATEGY
+MIN_BALANCE_CENTS = 500     # Stop if balance < $5.00
+MAX_TOTAL_POS = 20          # Max contracts to hold per market (Stop Loss)
+PROFIT_TAKE_PRICE = 92      # Sell automatically if price hits 92¢
 
 # CONFIDENCE SCALING (Forecast - Strike = Gap)
-LOW_CONF_COUNT = 1        # Gap > 2.0°
-MED_CONF_COUNT = 3        # Gap > 3.0°
-HIGH_CONF_COUNT = 10      # Gap > 5.0°
+LOW_CONF_COUNT = 1          # Gap > 2.0°
+MED_CONF_COUNT = 3          # Gap > 3.0°
+HIGH_CONF_COUNT = 10        # Gap > 5.0°
 
 def send_discord_alert(message):
-    """Sends a notification to your Discord channel."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        print("No Discord Webhook found. Skipping alert.")
-        return
-
-    payload = {"content": message}
+    if not webhook_url: return
     try:
-        requests.post(webhook_url, json=payload)
+        requests.post(webhook_url, json={"content": message})
     except Exception as e:
-        print(f"Failed to send Discord alert: {e}")
+        print(f"Discord Error: {e}")
 
-def get_forecast():
-    """Fetches forecasted high for NOLA Lakefront Airport."""
+def get_open_meteo_forecast():
+    """Source 1: Open-Meteo (Fast, simple)"""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={NOLA_LAT}&longitude={NOLA_LON}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
     try:
-        response = requests.get(url).json()
-        temp = response['daily']['temperature_2m_max'][0]
-        return temp
+        res = requests.get(url).json()
+        return res['daily']['temperature_2m_max'][0]
     except Exception as e:
-        print(f"Weather API Error: {e}")
+        print(f"OpenMeteo Error: {e}")
         return None
 
+def get_nws_forecast():
+    """Source 2: National Weather Service (Official Settlement Source)"""
+    # NWS requires a User-Agent or they block the request
+    headers = {'User-Agent': '(KalshiWeatherBot, contact@example.com)'}
+    
+    try:
+        # Step 1: Get the Gridpoint for these coordinates
+        point_url = f"https://api.weather.gov/points/{NOLA_LAT},{NOLA_LON}"
+        point_res = requests.get(point_url, headers=headers).json()
+        forecast_url = point_res['properties']['forecast']
+        
+        # Step 2: Get the Forecast from that Gridpoint
+        grid_res = requests.get(forecast_url, headers=headers).json()
+        periods = grid_res['properties']['periods']
+        
+        # Find the first "Daytime" period (Today's High)
+        for p in periods:
+            if p['isDaytime']:
+                return p['temperature']
+        return None
+    except Exception as e:
+        print(f"NWS API Error: {e}")
+        return None
+
+def check_for_profit_taking(portfolio_api, market_api):
+    """Scans portfolio and sells if we are winning big."""
+    print("--- Checking Profit Taking ---")
+    try:
+        positions = portfolio_api.get_positions().market_positions
+        for pos in positions:
+            if pos.position > 0:
+                # Check current price
+                orderbook = market_api.get_market_orderbook(pos.ticker)
+                # To sell, we hit the 'Yes' Bid (someone buying Yes)
+                if not orderbook.orderbook.yes: continue
+                
+                best_bid = orderbook.orderbook.yes[0][0]
+                
+                if best_bid >= PROFIT_TAKE_PRICE:
+                    print(f"💰 CASHING OUT {pos.ticker} @ {best_bid}¢")
+                    market_api.create_order(CreateOrderRequest(
+                        ticker=pos.ticker, action="sell", side="yes",
+                        count=pos.position, type="limit", yes_price=best_bid,
+                        client_order_id=str(uuid.uuid4())
+                    ))
+                    send_discord_alert(f"💰 **Profit Taken!** Sold {pos.position}x {pos.ticker} at **{best_bid}¢**")
+    except Exception as e:
+        print(f"Profit Taking Error: {e}")
+
 def main():
-    # 1. Credentials from GitHub Secrets
+    # 1. Credentials
     api_key_id = os.getenv("KALSHI_KEY")
     private_key_pem = os.getenv("KALSHI_PRIVATE_KEY")
     
     if not api_key_id or not private_key_pem:
-        print("Error: Missing Kalshi Credentials in GitHub Secrets.")
+        print("Missing Secrets.")
         return
 
     config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
@@ -59,98 +104,85 @@ def main():
     portfolio_api = kalshi_python.PortfolioApi(api_client)
     market_api = kalshi_python.MarketApi(api_client)
 
-    # 2. Safety Check: Balance
+    # 2. Risk Checks
     try:
-        balance_res = portfolio_api.get_balance()
-        balance = balance_res.balance
+        balance = portfolio_api.get_balance().balance
         if balance < MIN_BALANCE_CENTS:
-            print(f"Balance too low ({balance}¢). Stopping.")
+            print(f"Balance Low: {balance}¢")
             return
+        # Run Profit Taking Logic Before Buying
+        check_for_profit_taking(portfolio_api, market_api)
     except Exception as e:
-        print(f"Could not fetch balance: {e}")
+        print(f"Init Error: {e}")
         return
 
-    # 3. Get Forecast
-    forecast = get_forecast()
-    if not forecast: return
-    print(f"--- NOLA Forecast: {forecast}°F ---")
+    # 3. The "Ensemble" Forecast (Compare Sources)
+    om_temp = get_open_meteo_forecast()
+    nws_temp = get_nws_forecast()
+    
+    print(f"Forecasts -> OpenMeteo: {om_temp}°F | NWS: {nws_temp}°F")
+    
+    if not om_temp or not nws_temp:
+        print("One or more weather sources failed. Skipping run for safety.")
+        return
 
-    # 4. Find Active Markets
+    # Conservative Logic: Use the LOWER of the two to be safe
+    # If OM says 85 and NWS says 82, we assume 82.
+    safe_forecast = min(om_temp, nws_temp)
+    print(f"--- Trading based on Safe Forecast: {safe_forecast}°F ---")
+
+    # 4. Market Scan
     markets_res = market_api.get_markets(series_ticker=SERIES_TICKER, status="open")
-    if not markets_res.markets:
-        print("No active markets found.")
-        return
+    if not markets_res.markets: return
 
     for market in markets_res.markets:
-        # Extract strike temp from ticker (e.g. "KXHIGHTNOLA-26JAN21-T80" -> 80.0)
         try:
             strike = float(market.ticker.split('-T')[-1])
-        except ValueError:
-            continue # Skip if ticker format is weird
+        except ValueError: continue
 
-        gap = forecast - strike
+        gap = safe_forecast - strike
         
-        # LOGIC: Only trade if we have at least a 2-degree "cushion"
+        # LOGIC: Ensure gap is positive based on SAFE forecast
         if gap >= 2.0:
-            # Determine Size based on Confidence
-            if gap >= 5.0:
-                trade_qty, label = HIGH_CONF_COUNT, "HIGH"
-            elif gap >= 3.0:
-                trade_qty, label = MED_CONF_COUNT, "MEDIUM"
-            else:
-                trade_qty, label = LOW_CONF_COUNT, "LOW"
+            if gap >= 5.0: qty, label = HIGH_CONF_COUNT, "HIGH"
+            elif gap >= 3.0: qty, label = MED_CONF_COUNT, "MED"
+            else: qty, label = LOW_CONF_COUNT, "LOW"
             
-            # 5. Portfolio Check (Don't overbuy)
+            # Position Limit Check
             pos_res = portfolio_api.get_positions()
-            current_pos = next((p.position for p in pos_res.market_positions if p.ticker == market.ticker), 0)
+            curr_pos = next((p.position for p in pos_res.market_positions if p.ticker == market.ticker), 0)
             
-            if current_pos >= MAX_TOTAL_POS:
-                print(f"Max position reached for {market.ticker}. Skipping.")
-                continue
-            
-            # Reduce buy amount if we are near the limit
-            trade_qty = min(trade_qty, MAX_TOTAL_POS - current_pos)
-            if trade_qty <= 0: continue
+            qty = min(qty, MAX_TOTAL_POS - curr_pos)
+            if qty <= 0: continue
 
-            # 6. Pricing Logic (The "Mirror" Fix)
+            # Pricing Logic (100 - No_Bid)
             orderbook = market_api.get_market_orderbook(market.ticker)
-            
-            # We need someone buying "No" to sell us "Yes"
-            if not orderbook.orderbook.no:
-                print(f"No liquidity on {market.ticker} (No sellers).")
-                continue
+            if not orderbook.orderbook.no: continue
                 
             best_no_bid = orderbook.orderbook.no[0][0]
             buy_yes_price = 100 - best_no_bid
             
-            # Final Check: Is the price good? (< 75 cents)
+            # Spread Protection: Ensure the spread isn't insane
+            # If "Yes" cost is 60, but people are only selling Yes for 70, spread is 10.
+            # We are TAKING liquidity, so we pay the calculated price.
+            
             if buy_yes_price < 75:
-                print(f"Edge Found! Buying {trade_qty}x {market.ticker} @ {buy_yes_price}¢")
-                
+                print(f"Buying {qty}x {market.ticker} @ {buy_yes_price}¢")
                 try:
-                    # EXECUTE TRADE
                     market_api.create_order(CreateOrderRequest(
-                        ticker=market.ticker,
-                        action="buy",
-                        side="yes",
-                        count=trade_qty,
-                        type="limit",
-                        yes_price=buy_yes_price,
+                        ticker=market.ticker, action="buy", side="yes",
+                        count=qty, type="limit", yes_price=buy_yes_price,
                         client_order_id=str(uuid.uuid4())
                     ))
                     
-                    # SEND DISCORD ALERT
-                    msg = (f"**Kalshi Bot Alert** 🚨\n"
-                           f"Bought **{trade_qty}x** {market.ticker}\n"
-                           f"Confidence: **{label}** (Gap: {gap:.1f}°)\n"
-                           f"Price: **{buy_yes_price}¢** | Forecast: **{forecast}°F**")
+                    msg = (f"**Kalshi Bot Trade** 🦅\n"
+                           f"Strategy: **{label}** Confidence (Gap {gap:.1f}°)\n"
+                           f"Bought: **{qty}x {market.ticker}** @ {buy_yes_price}¢\n"
+                           f"Forecasts: NWS {nws_temp}° / OM {om_temp}°")
                     send_discord_alert(msg)
-                    
                 except Exception as e:
-                    print(f"Order failed: {e}")
-                    send_discord_alert(f"⚠️ Bot tried to buy {market.ticker} but failed: {e}")
-            else:
-                print(f"Price too high ({buy_yes_price}¢) for {market.ticker}. Gap: {gap}°")
+                    print(f"Order Fail: {e}")
+                    send_discord_alert(f"⚠️ Trade Failed: {e}")
 
 if __name__ == "__main__":
     main()
