@@ -1,0 +1,2 @@
+kalshi-python
+requests
