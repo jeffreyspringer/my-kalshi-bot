@@ -9,7 +9,13 @@ HISTORY_FILE = "balance_history.json"
 INITIAL_DEPOSIT = 100.00 
 
 def send_discord_report(current_val, change_val, change_pct, total_cash, total_positions):
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    # UPDATED: Look for the REPORT webhook first
+    webhook_url = os.getenv("DISCORD_REPORT_WEBHOOK_URL")
+    
+    # Fallback: If the new secret isn't there, use the old one so it doesn't break
+    if not webhook_url:
+        webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+        
     if not webhook_url: return
 
     color = 3066993 if change_val >= 0 else 15158332
@@ -46,12 +52,9 @@ def main():
         api_client = kalshi_python.ApiClient(config)
         portfolio_api = kalshi_python.PortfolioApi(api_client)
         
-        # Kalshi returns values in CENTS
         balance_data = portfolio_api.get_balance()
         cash = balance_data.balance / 100
-        
-        # Typically portfolio_value is available on this object or needs to be calculated
-        # If accessing portfolio value directly:
+        # If 'portfolio_value' is missing in your SDK version, calculate manually
         positions_val = getattr(balance_data, 'portfolio_value', 0) / 100 
         
         total_value = cash + positions_val 
