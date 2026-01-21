@@ -2,10 +2,8 @@ name: Kalshi Weather Bot
 
 on:
   schedule:
-    # This runs the bot at 14:00 UTC (8:00 AM New Orleans time) 
-    # and again at 18:00 UTC (12:00 PM New Orleans time).
-    - cron: '0 14,18 * * *'
-  workflow_dispatch: # Allows you to click a button to run it manually
+    # This runs at :00 and :30 of every hour
+    - cron: '*/30 * * * *'
 
 jobs:
   trade:
