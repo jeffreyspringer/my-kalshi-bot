@@ -2,13 +2,12 @@ name: Kalshi Weather Bot
 
 on:
   schedule:
-    # Runs at minute 17 and 47 of every hour (e.g., 12:17, 12:47)
-    # Using random "off-minutes" helps avoid GitHub's server delays.
+    # Run at minute 17 and 47 of every hour to avoid GitHub traffic jams
     - cron: '17,47 * * * *'
-  workflow_dispatch: # Allows you to force-run it manually
+  workflow_dispatch: # Allows manual trigger
 
 permissions:
-  contents: write  # <--- REQUIRED for saving the trade_log.csv file
+  contents: write  # Required to save trade_log.csv
 
 jobs:
   trade:
@@ -27,20 +26,20 @@ jobs:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # The "Kill Switch" variable (Defaults to TRUE if not found)
+          # Defaults to TRUE if you haven't set this variable yet
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }} 
-        run: python bot.py
+        # The "-u" flag is CRITICAL. It forces logs to show up immediately.
+        run: python -u bot.py
 
       - name: Commit Trade Log
-        # This step saves the 'trade_log.csv' back to your repository
-        # It includes a check to ensure the file exists so it doesn't crash on the first run.
+        # This saves the CSV file back to your repo if a trade happened
         run: |
           git config --global user.name "KalshiBot"
           git config --global user.email "bot@kalshi.com"
           
           if [ -f trade_log.csv ]; then
             git add trade_log.csv
-            # Only commit if the file actually changed (to avoid empty commit errors)
+            # Only commit if file actually changed
             git diff --quiet && git diff --staged --quiet || (git commit -m "Update trade log" && git push)
             echo "✅ Trade log updated."
           else
