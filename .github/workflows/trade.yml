@@ -2,39 +2,35 @@ name: Kalshi Weather Bot
 
 on:
   schedule:
-    # Runs at minute 0 of every hour (e.g., 10:00, 11:00, 12:00)
     - cron: '0 * * * *'
-  workflow_dispatch: # Allows you to run it manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write  # <--- REQUIRED for CSV Logging
 
 jobs:
   trade:
-    name: Run Trading Logic
     runs-on: ubuntu-latest
-
     steps:
-      # Step 1: Download your code from the repository
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      # Step 2: Install Python 3.10
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      # Step 3: Install the libraries listed in requirements.txt
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # Step 4: Run the bot with access to your Secrets
+      - run: pip install -r requirements.txt
+      
       - name: Run Bot
         env:
-          # These must match the names in your GitHub Secrets exactly
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Check for Kill Switch Variable (Optional, defaults to TRUE if missing)
+          TRADING_ENABLED: ${{ vars.TRADING_ENABLED }} 
         run: python bot.py
-        # Change the last line of trade.yml to: for testing
-        # run: python test_discord.py
+
+      - name: Commit Trade Log
+        run: |
+          git config --global user.name "KalshiBot"
+          git config --global user.email "bot@kalshi.com"
+          git add trade_log.csv
+          # Only commit if file changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update trade log" && git push)
