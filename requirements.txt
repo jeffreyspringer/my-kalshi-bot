@@ -1,2 +1,3 @@
 kalshi-python
 requests
+cryptography
