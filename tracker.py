@@ -7,7 +7,7 @@ from datetime import datetime
 # --- CONFIGURATION ---
 HISTORY_FILE = "balance_history.json"
 # If this is your first run, we use this as the 'start' value if file is missing
-INITIAL_DEPOSIT = 100.00 
+INITIAL_DEPOSIT = 236.68 
 
 def send_discord_report(current_val, change_val, change_pct, total_cash, total_positions):
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
