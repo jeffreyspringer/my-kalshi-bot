@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # <--- REQUIRED for CSV Logging
+  contents: write
 
 jobs:
   trade:
@@ -23,14 +23,19 @@ jobs:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # Check for Kill Switch Variable (Optional, defaults to TRUE if missing)
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }} 
         run: python bot.py
 
       - name: Commit Trade Log
+        # FIX: Check if file exists before trying to add it
         run: |
           git config --global user.name "KalshiBot"
           git config --global user.email "bot@kalshi.com"
-          git add trade_log.csv
-          # Only commit if file changed
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update trade log" && git push)
+          
+          if [ -f trade_log.csv ]; then
+            git add trade_log.csv
+            git diff --quiet && git diff --staged --quiet || (git commit -m "Update trade log" && git push)
+            echo "✅ Trade log updated."
+          else
+            echo "⚠️ No trade log found (no trades made). Skipping commit."
+          fi
