@@ -1,0 +1,29 @@
+# --- Python Basics ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# --- Virtual Environments (if you run locally) ---
+venv/
+env/
+.venv/
+
+# --- Security (CRITICAL) ---
+# Never upload your private keys or API configs
+*.pem
+.env
+keys/
+secrets.json
+
+# --- OS System Files ---
+.DS_Store
+Thumbs.db
+
+# --- Editor Settings (Optional) ---
+.vscode/
+.idea/
+
+# --- Note on History ---
+# Do NOT ignore 'balance_history.json' because we want 
+# the bot to update and save it to GitHub every day.
