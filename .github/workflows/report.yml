@@ -2,12 +2,12 @@ name: Daily PnL Report
 
 on:
   schedule:
-    # Runs at 04:55 UTC (which is 11:55 PM New Orleans time/CST)
+    # Runs at 04:55 UTC (approx 10:55 PM Central / 11:55 PM Eastern)
     - cron: '55 4 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual trigger
 
 permissions:
-  contents: write  # <--- Needed to save the history file
+  contents: write  # Required to save balance_history.json
 
 jobs:
   report:
@@ -23,20 +23,25 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install kalshi-python requests cryptography
+          pip install -r requirements.txt
 
       - name: Run Tracker
         env:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          # The new secret for your PnL channel
+          DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }}
+          # Fallback to the main channel if the report one fails
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python tracker.py
 
       - name: Commit and Save History
-        # This step saves the updated 'balance_history.json' back to GitHub
         run: |
           git config --global user.name "KalshiBot"
           git config --global user.email "bot@kalshi.com"
-          git add balance_history.json
-          # Only commit if the file actually changed
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update daily balance history" && git push)
+          
+          # Only commit if the tracker actually updated the file
+          if [ -f balance_history.json ]; then
+            git add balance_history.json
+            git diff --quiet && git diff --staged --quiet || (git commit -m "Update daily balance history" && git push)
+          fi
