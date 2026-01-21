@@ -35,6 +35,6 @@ jobs:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        # run: python bot.py
-        # Change the last line of trade.yml to:
-        run: python test_discord.py
+        run: python bot.py
+        # Change the last line of trade.yml to: for testing
+        # run: python test_discord.py
