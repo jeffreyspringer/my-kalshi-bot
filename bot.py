@@ -87,7 +87,8 @@ def check_for_profit_taking(portfolio_api, market_api):
                 
                 if best_bid >= PROFIT_TAKE_PRICE:
                     print(f"💰 SELLING {pos.ticker} @ {best_bid}¢")
-                    market_api.create_order(CreateOrderRequest(
+                    # Note: create_order is usually on portfolio_api in v2 SDK
+                    portfolio_api.create_order(CreateOrderRequest(
                         ticker=pos.ticker, action="sell", side="yes",
                         count=pos.position, type="limit", yes_price=best_bid,
                         client_order_id=str(uuid.uuid4())
@@ -106,7 +107,9 @@ def main():
     # 1. Credentials
     api_key_id = os.getenv("KALSHI_KEY")
     private_key_pem = os.getenv("KALSHI_PRIVATE_KEY")
-    if not api_key_id or not private_key_pem: return
+    if not api_key_id or not private_key_pem: 
+        print("Missing API Keys.")
+        return
 
     config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
     config.api_key_id = api_key_id
@@ -114,7 +117,8 @@ def main():
     
     api_client = kalshi_python.ApiClient(config)
     portfolio_api = kalshi_python.PortfolioApi(api_client)
-    market_api = kalshi_python.MarketApi(api_client)
+    # FIX: Changed MarketApi -> MarketsApi
+    market_api = kalshi_python.MarketsApi(api_client)
 
     # 2. Risk Checks
     try:
@@ -123,7 +127,9 @@ def main():
             print(f"Balance Low: {balance}¢")
             return
         check_for_profit_taking(portfolio_api, market_api)
-    except Exception: return
+    except Exception as e: 
+        print(f"Risk Check Error: {e}")
+        return
 
     # 3. Ensemble Forecast
     om_temp = get_open_meteo_forecast()
@@ -176,7 +182,8 @@ def main():
             if buy_yes_price < target_price_limit:
                 print(f"Buying {qty}x {market.ticker} @ {buy_yes_price}¢")
                 try:
-                    market_api.create_order(CreateOrderRequest(
+                    # FIX: create_order typically lives on portfolio_api
+                    portfolio_api.create_order(CreateOrderRequest(
                         ticker=market.ticker, action="buy", side="yes",
                         count=qty, type="limit", yes_price=buy_yes_price,
                         client_order_id=str(uuid.uuid4())
