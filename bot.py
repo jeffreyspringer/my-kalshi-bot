@@ -6,8 +6,9 @@ import kalshi_python
 from kalshi_python.models import *
 
 # --- CONFIGURATION ---
-# New Orleans Lakefront Airport (KNEW)
-NOLA_LAT, NOLA_LON = 30.05, -90.03
+# UPDATED: Louis Armstrong New Orleans Intl (KMSY)
+# This is the official settlement station for Kalshi NOLA markets.
+NOLA_LAT, NOLA_LON = 29.99, -90.25
 SERIES_TICKER = "KXHIGHTNOLA"
 
 # RISK & STRATEGY
@@ -40,11 +41,10 @@ def get_open_meteo_forecast():
 
 def get_nws_forecast():
     """Source 2: National Weather Service (Official Settlement Source)"""
-    # NWS requires a User-Agent or they block the request
     headers = {'User-Agent': '(KalshiWeatherBot, contact@example.com)'}
     
     try:
-        # Step 1: Get the Gridpoint for these coordinates
+        # Step 1: Get the Gridpoint for these NEW coordinates (KMSY)
         point_url = f"https://api.weather.gov/points/{NOLA_LAT},{NOLA_LON}"
         point_res = requests.get(point_url, headers=headers).json()
         forecast_url = point_res['properties']['forecast']
@@ -53,7 +53,6 @@ def get_nws_forecast():
         grid_res = requests.get(forecast_url, headers=headers).json()
         periods = grid_res['properties']['periods']
         
-        # Find the first "Daytime" period (Today's High)
         for p in periods:
             if p['isDaytime']:
                 return p['temperature']
@@ -69,9 +68,7 @@ def check_for_profit_taking(portfolio_api, market_api):
         positions = portfolio_api.get_positions().market_positions
         for pos in positions:
             if pos.position > 0:
-                # Check current price
                 orderbook = market_api.get_market_orderbook(pos.ticker)
-                # To sell, we hit the 'Yes' Bid (someone buying Yes)
                 if not orderbook.orderbook.yes: continue
                 
                 best_bid = orderbook.orderbook.yes[0][0]
@@ -110,24 +107,21 @@ def main():
         if balance < MIN_BALANCE_CENTS:
             print(f"Balance Low: {balance}¢")
             return
-        # Run Profit Taking Logic Before Buying
         check_for_profit_taking(portfolio_api, market_api)
     except Exception as e:
         print(f"Init Error: {e}")
         return
 
-    # 3. The "Ensemble" Forecast (Compare Sources)
+    # 3. The "Ensemble" Forecast
     om_temp = get_open_meteo_forecast()
     nws_temp = get_nws_forecast()
     
-    print(f"Forecasts -> OpenMeteo: {om_temp}°F | NWS: {nws_temp}°F")
+    print(f"Forecasts (KMSY) -> OpenMeteo: {om_temp}°F | NWS: {nws_temp}°F")
     
     if not om_temp or not nws_temp:
-        print("One or more weather sources failed. Skipping run for safety.")
+        print("Weather source failed. Skipping.")
         return
 
-    # Conservative Logic: Use the LOWER of the two to be safe
-    # If OM says 85 and NWS says 82, we assume 82.
     safe_forecast = min(om_temp, nws_temp)
     print(f"--- Trading based on Safe Forecast: {safe_forecast}°F ---")
 
@@ -142,29 +136,22 @@ def main():
 
         gap = safe_forecast - strike
         
-        # LOGIC: Ensure gap is positive based on SAFE forecast
         if gap >= 2.0:
             if gap >= 5.0: qty, label = HIGH_CONF_COUNT, "HIGH"
             elif gap >= 3.0: qty, label = MED_CONF_COUNT, "MED"
             else: qty, label = LOW_CONF_COUNT, "LOW"
             
-            # Position Limit Check
             pos_res = portfolio_api.get_positions()
             curr_pos = next((p.position for p in pos_res.market_positions if p.ticker == market.ticker), 0)
             
             qty = min(qty, MAX_TOTAL_POS - curr_pos)
             if qty <= 0: continue
 
-            # Pricing Logic (100 - No_Bid)
             orderbook = market_api.get_market_orderbook(market.ticker)
             if not orderbook.orderbook.no: continue
                 
             best_no_bid = orderbook.orderbook.no[0][0]
             buy_yes_price = 100 - best_no_bid
-            
-            # Spread Protection: Ensure the spread isn't insane
-            # If "Yes" cost is 60, but people are only selling Yes for 70, spread is 10.
-            # We are TAKING liquidity, so we pay the calculated price.
             
             if buy_yes_price < 75:
                 print(f"Buying {qty}x {market.ticker} @ {buy_yes_price}¢")
@@ -175,7 +162,7 @@ def main():
                         client_order_id=str(uuid.uuid4())
                     ))
                     
-                    msg = (f"**Kalshi Bot Trade** 🦅\n"
+                    msg = (f"**Kalshi Bot Trade (KMSY)** 🦅\n"
                            f"Strategy: **{label}** Confidence (Gap {gap:.1f}°)\n"
                            f"Bought: **{qty}x {market.ticker}** @ {buy_yes_price}¢\n"
                            f"Forecasts: NWS {nws_temp}° / OM {om_temp}°")
