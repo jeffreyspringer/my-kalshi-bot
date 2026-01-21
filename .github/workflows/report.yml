@@ -1,0 +1,42 @@
+name: Daily PnL Report
+
+on:
+  schedule:
+    # Runs at 04:55 UTC (which is 11:55 PM New Orleans time/CST)
+    - cron: '55 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # <--- Needed to save the history file
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install kalshi-python requests cryptography
+
+      - name: Run Tracker
+        env:
+          KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python tracker.py
+
+      - name: Commit and Save History
+        # This step saves the updated 'balance_history.json' back to GitHub
+        run: |
+          git config --global user.name "KalshiBot"
+          git config --global user.email "bot@kalshi.com"
+          git add balance_history.json
+          # Only commit if the file actually changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update daily balance history" && git push)
