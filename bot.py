@@ -6,19 +6,22 @@ from kalshi_python.models import *
 
 # --- CONFIGURATION ---
 NOLA_LAT, NOLA_LON = 30.05, -90.03
-SERIES_TICKER = "KXHIGHTNOLA" 
+SERIES_TICKER = "KXHIGHTNOLA"
+MIN_BALANCE_CENTS = 500  # Stop trading if balance is below $5.00
+MAX_CONTRACTS_PER_MARKET = 5 # Don't own more than 5 of the same contract
 
 def get_forecast():
+    """Fetches forecasted high for NOLA Lakefront Airport."""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={NOLA_LAT}&longitude={NOLA_LON}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
     try:
         response = requests.get(url).json()
         return response['daily']['temperature_2m_max'][0]
     except Exception as e:
-        print(f"Error fetching weather: {e}")
+        print(f"Weather API Error: {e}")
         return None
 
 def main():
-    # 1. Credentials
+    # 1. Credentials from GitHub Secrets
     api_key_id = os.getenv("KALSHI_KEY")
     private_key_pem = os.getenv("KALSHI_PRIVATE_KEY")
     
@@ -27,42 +30,67 @@ def main():
     config.private_key_pem = private_key_pem
     
     api_client = kalshi_python.ApiClient(config)
-    kalshi_api = kalshi_python.MarketApi(api_client)
+    
+    # We use both Portfolio and Market APIs
+    portfolio_api = kalshi_python.PortfolioApi(api_client)
+    market_api = kalshi_python.MarketApi(api_client)
 
-    # 2. Get Data
+    # 2. Safety Check: Balance
+    try:
+        balance_res = portfolio_api.get_balance()
+        balance = balance_res.balance
+        print(f"Current Balance: ${balance/100:.2f}")
+        if balance < MIN_BALANCE_CENTS:
+            print("Balance too low. Stopping.")
+            return
+    except Exception as e:
+        print(f"Could not fetch balance: {e}")
+        return
+
+    # 3. Get Weather Data
     forecast = get_forecast()
     if not forecast: return
-    print(f"--- NOLA BOT RUN: Forecast {forecast}°F ---")
+    print(f"Forecast for NOLA: {forecast}°F")
 
-    # 3. Find Market
-    markets_res = kalshi_api.get_markets(series_ticker=SERIES_TICKER, status="open")
+    # 4. Find Best Market
+    markets_res = market_api.get_markets(series_ticker=SERIES_TICKER, status="open")
     if not markets_res.markets:
-        print("No open markets found.")
+        print("No active markets.")
         return
 
     for market in markets_res.markets:
         strike = float(market.ticker.split('-T')[-1])
         
-        # If forecast is 3 degrees higher than strike, it's a strong 'YES' candidate
-        if forecast >= (strike + 3):
-            print(f"Target found: {market.ticker}")
+        # LOGIC: Forecast is at least 2 degrees above strike
+        if forecast >= (strike + 2):
+            ticker = market.ticker
+            print(f"Found Edge on {ticker}")
+
+            # 5. Check if we already own too much of this ticker
+            positions_res = portfolio_api.get_positions()
+            current_pos = 0
+            for p in positions_res.market_positions:
+                if p.ticker == ticker:
+                    current_pos = p.position
+                    break
             
-            # Check price and "Spread"
-            orderbook = kalshi_api.get_market_orderbook(market.ticker)
-            
-            # price to buy YES is the 'No' ask side
+            if current_pos >= MAX_CONTRACTS_PER_MARKET:
+                print(f"Already holding {current_pos} contracts. Skipping.")
+                continue
+
+            # 6. Check Orderbook for Price
+            orderbook = market_api.get_market_orderbook(ticker)
             if not orderbook.orderbook.no:
-                print("No liquidity (nobody is selling). Skipping.")
+                print("No sellers available.")
                 continue
                 
             yes_price = orderbook.orderbook.no[0][0]
             
-            # LOGIC: Buy if probability is high (forecast > strike) 
-            # and price is relatively cheap (< 65 cents)
-            if yes_price < 65:
-                print(f"Price is {yes_price}c. Placing Buy Order.")
-                kalshi_api.create_order(CreateOrderRequest(
-                    ticker=market.ticker,
+            # Final buy condition: Forecast is strong AND price is < 75 cents
+            if yes_price < 75:
+                print(f"Executing Buy at {yes_price}c...")
+                market_api.create_order(CreateOrderRequest(
+                    ticker=ticker,
                     action="buy",
                     side="yes",
                     count=1,
@@ -71,7 +99,7 @@ def main():
                     client_order_id=str(uuid.uuid4())
                 ))
             else:
-                print(f"Price too high ({yes_price}c). No edge.")
+                print(f"Price too high ({yes_price}c).")
 
 if __name__ == "__main__":
     main()
