@@ -2,26 +2,31 @@ name: Kalshi Weather Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # Runs every hour on the hour
-  workflow_dispatch: # Allows you to run it manually for testing
+    # This runs the bot at 14:00 UTC (8:00 AM New Orleans time) 
+    # and again at 18:00 UTC (12:00 PM New Orleans time).
+    - cron: '0 14,18 * * *'
+  workflow_dispatch: # Allows you to click a button to run it manually
 
 jobs:
-  build:
+  trade:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run Trading Bot
         env:
+          # These must match your GitHub Secrets names exactly
           KALSHI_KEY: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
         run: python bot.py
