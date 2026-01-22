@@ -52,16 +52,15 @@ class KalshiClient:
     def _req(self, method, path, body=None):
         timestamp = str(int(time.time() * 1000))
         
-        # 1. Prepare JSON Body (Standard formatting with sort_keys for consistency)
+        # ✅ FIX: Force compact JSON (no spaces)
+        # separators=(',', ':') removes the whitespace Python adds by default
         json_str = ""
         if body:
-            json_str = json.dumps(body, sort_keys=True)
+            json_str = json.dumps(body, separators=(',', ':'))
             
-        # 2. Build Message String for Signing
-        # Format: timestamp + method + path + body
+        # Sign the EXACT string we are about to send
         msg_str = f"{timestamp}{method}/trade-api/v2{path}{json_str}"
         
-        # 3. Sign the UTF-8 Bytes of the message
         signature = self.private_key.sign(
             msg_str.encode('utf-8'),
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
@@ -77,15 +76,14 @@ class KalshiClient:
         
         url = f"{HOST}/trade-api/v2{path}"
         
-        # 4. Send exact JSON bytes
         if method == "GET": 
             return self.session.get(url, headers=headers, timeout=10)
         
-        # Send the exact string we signed, encoded as UTF-8 bytes
-        return self.session.post(url, headers=headers, data=json_str.encode('utf-8'), timeout=10)
+        # ✅ FIX: Send the string as 'data', NOT 'json'
+        # This prevents the requests library from re-adding spaces
+        return self.session.post(url, headers=headers, data=json_str, timeout=10)
 
     def place_order(self, ticker, action, side, count, price):
-        # Explicit integer casting to avoid float issues in JSON
         body = {
             "action": action, 
             "count": int(count), 
@@ -102,9 +100,9 @@ class KalshiClient:
         if res.status_code == 201:
             print(f"   ✅ ORDER SUCCESS: {ticker} @ {price}¢ [ID: {res.json().get('order_id')}]")
         else:
-            # Print the failure details for debugging
             print(f"   ❌ REJECTED: {res.status_code}")
-            print(f"   ⚠️ Payload: {json.dumps(body)}")
+            # If rejected again, seeing the Compact Payload will confirm the fix
+            print(f"   ⚠️ Payload sent: {json.dumps(body, separators=(',', ':'))}") 
             print(f"   ⚠️ Response: {res.text}")
             
         return res
@@ -127,11 +125,10 @@ def get_today_high_so_far(airport_code, tz_offset):
     except: return 0
 
 def main():
-    print("🚀 Bot Starting (V49 Authenticator)...")
+    print("🚀 Bot Starting (V50 Strict Serializer)...")
     client = KalshiClient()
     target_date_str = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%y%b%d").upper()
     
-    # Check Balance
     try:
         bal_res = client._req("GET", "/portfolio/balance")
         if bal_res.status_code == 200:
