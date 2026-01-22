@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-# --- CONFIGURATION (NO CHANGES NEEDED HERE) ---
+# --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
 CASHOUT_HOUR = 21   
 STATS_FILE = "city_stats.json"
@@ -33,8 +33,6 @@ PROFIT_TAKE_PRICE = 92
 MIN_PRICE = 2              
 MAX_PRICE = 98
 LOW_CONF_COUNT = 1
-MED_CONF_COUNT = 3
-HIGH_CONF_COUNT = 10
 
 class KalshiClient:
     def __init__(self):
@@ -61,27 +59,28 @@ class KalshiClient:
         if method == "GET": return self.session.get(url, headers=headers, timeout=10)
         return self.session.post(url, headers=headers, json=body, timeout=10)
 
-    def get_balance(self):
-        try:
-            res = self._req("GET", "/portfolio/balance")
-            res.raise_for_status()
-            return res.json().get("balance", 0)
-        except: return 1000 # Fallback
-
-    def get_positions(self):
-        try:
-            res = self._req("GET", "/portfolio/positions")
-            res.raise_for_status()
-            return res.json().get("market_positions", [])
-        except: return []
-
     def place_order(self, ticker, action, side, count, price):
-        body = {"action": action, "count": count, "type": "limit", "ticker": ticker, "side": side, "yes_price": price if side == "yes" else 0, "no_price": price if side == "no" else 0, "client_order_id": str(uuid.uuid4())}
+        body = {
+            "action": action, 
+            "count": count, 
+            "type": "limit", 
+            "ticker": ticker, 
+            "side": side, 
+            "yes_price": price if side == "yes" else 0, 
+            "no_price": price if side == "no" else 0, 
+            "client_order_id": str(uuid.uuid4())
+        }
         if side == "yes": del body["no_price"]
         else: del body["yes_price"]
-        return self._req("POST", "/portfolio/orders", body)
+        
+        # ✅ VERIFICATION: Check the response status
+        res = self._req("POST", "/portfolio/orders", body)
+        if res.status_code == 201:
+            print(f"   ✅ ORDER CREATED: {ticker} (ID: {res.json().get('order_id')})")
+        else:
+            print(f"   ❌ ORDER REJECTED: {res.status_code} - {res.text}")
+        return res
 
-# --- UTILITIES ---
 def get_today_high_so_far(airport_code, tz_offset):
     try:
         headers = {'User-Agent': '(KalshiBot)'}
@@ -99,27 +98,32 @@ def get_today_high_so_far(airport_code, tz_offset):
     except: return 0
 
 def main():
-    print("🚀 Bot Starting (V46 Direct Price)...")
+    print("🚀 Bot Starting (V47 Debugger)...")
     client = KalshiClient()
     target_date_str = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%y%b%d").upper()
     
-    all_positions = client.get_positions()
+    # Pre-fetch balance to ensure session works
+    try:
+        balance_res = client._req("GET", "/portfolio/balance")
+        balance_res.raise_for_status()
+        print(f"💰 Account Balance: ${balance_res.json().get('balance', 0)/100:.2f}")
+    except Exception as e:
+        print(f"⚠️ Could not fetch balance: {e}")
 
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
-        nws_res = requests.get(f"https://api.weather.gov/points/{city['lat']},{city['lon']}", headers={'User-Agent': '(KalshiBot)'}).json()
-        daily = requests.get(nws_res['properties']['forecast'], headers={'User-Agent': '(KalshiBot)'}).json()['properties']['periods'][0]['temperature']
-        hourly_res = requests.get(nws_res['properties']['forecastHourly'], headers={'User-Agent': '(KalshiBot)'}).json()
-        hourly_max = max([p['temperature'] for p in hourly_res['properties']['periods'][:18]])
-        hist_high = get_today_high_so_far(city['airport'], city['tz_offset'])
-        
-        safe_forecast = max((daily + hourly_max)/2, hist_high)
-        print(f"   🎯 Target: {safe_forecast:.1f}° (Hist: {hist_high}°)")
-        
-        has_pos = any(p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker'] for p in all_positions)
-        
-        # ✅ FIX: Fetching actual market prices directly from the Market list
-        markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
+        try:
+            nws_res = requests.get(f"https://api.weather.gov/points/{city['lat']},{city['lon']}", headers={'User-Agent': '(KalshiBot)'}).json()
+            daily = requests.get(nws_res['properties']['forecast'], headers={'User-Agent': '(KalshiBot)'}).json()['properties']['periods'][0]['temperature']
+            hourly_res = requests.get(nws_res['properties']['forecastHourly'], headers={'User-Agent': '(KalshiBot)'}).json()
+            hourly_max = max([p['temperature'] for p in hourly_res['properties']['periods'][:18]])
+            hist_high = get_today_high_so_far(city['airport'], city['tz_offset'])
+            safe_forecast = max((daily + hourly_max)/2, hist_high)
+            print(f"   🎯 Target: {safe_forecast:.1f}°")
+        except: continue
+
+        markets_res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
+        markets = markets_res.json().get("markets", [])
 
         for market in markets:
             if target_date_str not in market['ticker']: continue
@@ -127,23 +131,20 @@ def main():
             except: continue
             
             diff = abs(safe_forecast - strike)
-            target_side = "yes" if diff <= 0.6 and not has_pos else ("no" if diff >= 1.8 else "none")
+            target_side = "yes" if diff <= 0.6 else ("no" if diff >= 1.8 else "none")
             if target_side == "none": continue
 
-            # ✅ FIX: Use the 'yes_price' and 'no_price' provided by the Market API
-            # These values represent the current market consensus, not empty orderbooks.
+            # Pricing logic using last trade as baseline
             if target_side == "yes":
-                price = market.get('yes_bid', 0) + 1 # Bid slightly above market to get filled
-                if price == 1: price = market.get('last_price', 50) # Fallback to last trade
+                price = market.get('yes_bid', 0) + 2 
+                if price <= 2: price = market.get('last_price', 20)
             else:
-                price = market.get('no_bid', 0) + 1
-                if price == 1: price = (100 - market.get('last_price', 50))
+                price = market.get('no_bid', 0) + 2
+                if price <= 2: price = (100 - market.get('last_price', 80))
 
-            if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   🚧 Skipping {strike}°: Price {price}¢ out of range.")
-                continue
+            if price < MIN_PRICE or price > MAX_PRICE: continue
             
-            print(f"   🚀 Buying {target_side.upper()} for {strike}° at {price}¢ (Diff {diff:.1f})")
+            print(f"   🚀 Attempting {target_side.upper()} for {strike}° @ {price}¢")
             client.place_order(market['ticker'], "buy", target_side, LOW_CONF_COUNT, price)
 
 if __name__ == "__main__": main()
