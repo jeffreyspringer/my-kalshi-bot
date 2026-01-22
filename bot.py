@@ -66,11 +66,9 @@ def get_nws_forecast(lat, lon):
         point_res = requests.get(point_url, headers=headers).json()
         if 'status' in point_res and point_res['status'] >= 400:
             return None
-            
         forecast_url = point_res['properties']['forecast']
         grid_res = requests.get(forecast_url, headers=headers).json()
         periods = grid_res['properties']['periods']
-        
         for p in periods:
             if p['isDaytime']:
                 return p['temperature']
@@ -88,7 +86,6 @@ def check_for_profit_taking(portfolio_api, market_api):
                 orderbook = market_api.get_market_orderbook(pos.ticker)
                 if not orderbook.orderbook.yes: continue
                 best_bid = orderbook.orderbook.yes[0][0]
-                
                 if best_bid >= PROFIT_TAKE_PRICE:
                     print(f"💰 SELLING {pos.ticker} @ {best_bid}¢")
                     portfolio_api.create_order(CreateOrderRequest(
@@ -104,41 +101,41 @@ def check_for_profit_taking(portfolio_api, market_api):
 def main():
     print("🚀 Bot Starting...")
 
-    # 0. Kill Switch
-    if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE":
-        print("🛑 Trading DISABLED via Env Var.")
-        return
+    # 1. Credentials with AGGRESSIVE STRIPPING
+    api_key_id = os.getenv("KALSHI_KEY", "").strip()
+    private_key_pem = os.getenv("KALSHI_PRIVATE_KEY", "").strip()
 
-    # 1. Credentials
-    api_key_id = os.getenv("KALSHI_KEY")
-    private_key_pem = os.getenv("KALSHI_PRIVATE_KEY")
-    
     if not api_key_id or not private_key_pem: 
         print("❌ CRITICAL: Missing API Keys in Secrets!")
         return
 
-    # --- 🛠️ KEY REPAIR STATION 🛠️ ---
-    # This automatically fixes keys broken by GitHub Secrets formatting
-    if private_key_pem:
-        # Replace literal "\n" characters with actual newlines
+    # --- 🛠️ KEY REPAIR STATION (VERSION 5.1) 🛠️ ---
+    # 1. Clean up "escaped" newlines from GitHub secrets
+    if "\\n" in private_key_pem:
+        print("🔧 Repairing: Converting escaped newlines to real newlines...")
         private_key_pem = private_key_pem.replace('\\n', '\n')
-        
-        # Ensure headers have correct spacing
-        if "-----BEGIN RSA PRIVATE KEY-----" in private_key_pem:
-             private_key_pem = private_key_pem.replace("-----BEGIN RSA PRIVATE KEY----- ", "-----BEGIN RSA PRIVATE KEY-----\n")
-             private_key_pem = private_key_pem.replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----\n")
-             # Fix double newlines if we added too many
-             private_key_pem = private_key_pem.replace("-----\n\n", "-----\n")
 
-        if "-----END RSA PRIVATE KEY-----" in private_key_pem:
-             private_key_pem = private_key_pem.replace(" -----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----")
-             private_key_pem = private_key_pem.replace("-----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----")
-             # Fix double newlines
-             private_key_pem = private_key_pem.replace("\n\n-----", "\n-----")
-    # ------------------------------------
+    # 2. Add Headers if missing (Rare but possible)
+    if "-----BEGIN RSA PRIVATE KEY-----" not in private_key_pem:
+        print("🔧 Repairing: Adding missing BEGIN Header...")
+        private_key_pem = "-----BEGIN RSA PRIVATE KEY-----\n" + private_key_pem
+    
+    if "-----END RSA PRIVATE KEY-----" not in private_key_pem:
+        print("🔧 Repairing: Adding missing END Header...")
+        private_key_pem = private_key_pem + "\n-----END RSA PRIVATE KEY-----"
+
+    # --- 🩺 KEY DOCTOR DIAGNOSIS (SAFE TO VIEW) 🩺 ---
+    print(f"📋 KEY ID CHECK: Length={len(api_key_id)} | First 4='{api_key_id[:4]}...' | Last 4='...{api_key_id[-4:]}'")
+    
+    key_lines = private_key_pem.split('\n')
+    print(f"📋 PVT KEY CHECK: Total Lines={len(key_lines)} | Total Length={len(private_key_pem)}")
+    if len(key_lines) < 2:
+        print("⚠️ WARNING: Private Key looks 'flattened' (1 line). Authentication will likely fail.")
+    else:
+        print("✅ Private Key format looks correct (Multiple lines detected).")
+    # ------------------------------------------------
 
     try:
-        # Using the Elections URL which was resolving correctly for you
         config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
         config.api_key_id = api_key_id
         config.private_key_pem = private_key_pem
@@ -162,7 +159,6 @@ def main():
         check_for_profit_taking(portfolio_api, market_api)
     except Exception as e: 
         print(f"❌ CRITICAL ERROR in Risk Checks: {e}")
-        print("💡 TIP: If this is still 401, verify your KALSHI_KEY is the UUID (e.g., 123-abc) and NOT the file name.")
         return
 
     # --- MAIN CITY LOOP ---
