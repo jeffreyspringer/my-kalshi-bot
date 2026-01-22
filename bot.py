@@ -30,7 +30,7 @@ MIN_BALANCE_CENTS = 500
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
 MIN_PRICE = 2              
-MAX_PRICE = 98
+MAX_PRICE = 98 # Buying above 98 is usually bad math
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
@@ -142,7 +142,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V33 (Transparency)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V34 (Smart)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -166,7 +166,6 @@ def get_lamp_forecast(airport_code):
         if res.status_code != 200: return None
         tmp_line = None
         for line in res.text.split('\n'):
-            # More robust parsing for LAMP lines
             if "TMP" in line and len(line) > 20: 
                 tmp_line = line
                 break
@@ -271,7 +270,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V33 Transparency)...")
+    print("🚀 Bot Starting (V34 Smart Direction)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -308,58 +307,63 @@ def main():
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: print("   ⚠️ API Error fetching markets"); continue
         
-        print(f"   [DEBUG] API returned {len(markets)} markets total.")
-        
         if not markets: continue
 
         for market in markets:
             ticker = market['ticker']
-            
-            # 🔍 TRANSPARENCY: Tell us if the date is wrong
-            if target_date_str not in ticker:
-                print(f"   [SKIP] {ticker} (Wrong Date)")
-                continue
+            if target_date_str not in ticker: continue
             
             try: strike = float(ticker.split('-T')[-1])
             except: continue
             
-            distance = abs(safe_forecast - strike)
+            # --- CORRECTED LOGIC ---
+            # Positive Delta = Forecast is Hotter than Strike (Expect YES)
+            # Negative Delta = Forecast is Colder than Strike (Expect NO)
+            delta = safe_forecast - strike
             
-            # LOGIC: Pick the winning side
-            target_side = "no"
-            if distance <= 1.5: target_side = "yes"
+            target_side = "none"
             
-            if target_side == "no" and distance < 3.0:
-                print(f"   Skipping {strike}°: Too risky for NO (Dist {distance:.1f})")
+            # 1. Hotter than strike?
+            if delta > 1.5: 
+                target_side = "yes"
+            # 2. Colder than strike?
+            elif delta < -1.5:
+                target_side = "no"
+            else:
+                print(f"   Skipping {strike}°: Too Close (Delta {delta:.1f})")
                 continue
 
             ob = client.get_orderbook(ticker)
-            if not ob: 
-                print(f"   Skipping {strike}°: Orderbook Empty")
-                continue
+            if not ob: continue
                 
+            # --- PRICE CALCULATION ---
+            # To Buy YES, we pay the YES Ask. (Estimated as 100 - NO Bid)
+            # To Buy NO, we pay the NO Ask. (Estimated as 100 - YES Bid)
+            
+            yes_bid = ob['yes'][0][0] if ob['yes'] else 0
+            no_bid = ob['no'][0][0] if ob['no'] else 0
+            
             price = 0
             if target_side == "yes":
-                if not ob['no']: 
-                    print(f"   Skipping {strike}°: No Sellers for YES")
+                if no_bid == 0: 
+                    print(f"   Skipping {strike}° [YES]: No Liquidity (No Bids)")
                     continue
-                price = 100 - ob['no'][0][0]
+                price = 100 - no_bid # This is roughly the Ask price for Yes
             else: 
-                if not ob['yes']: 
-                    print(f"   Skipping {strike}°: No Sellers for NO")
+                if yes_bid == 0: 
+                    print(f"   Skipping {strike}° [NO]: No Liquidity (Yes Bids)")
                     continue
-                price = 100 - ob['yes'][0][0]
+                price = 100 - yes_bid # This is roughly the Ask price for No
 
             if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   Skipping {strike}°: Price {price}¢ is outside safe zone")
+                print(f"   Skipping {strike}° [{target_side.upper()}]: Price {price}¢ out of range")
                 continue
 
             qty = LOW_CONF_COUNT
-            if target_side == "yes": qty = MED_CONF_COUNT
-            if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT
+            if abs(delta) > 4.0: qty = MED_CONF_COUNT # High confidence
             
-            print(f"   🚀 EXECUTE: Buying {qty}x {ticker} [{target_side}] @ {price}¢")
-            execute_buy(client, market, qty, price, target_side, distance, safe_forecast)
+            print(f"   🚀 EXECUTE: Buying {qty}x {ticker} [{target_side}] @ {price}¢ (Delta {delta:.1f})")
+            execute_buy(client, market, qty, price, target_side, abs(delta), safe_forecast)
 
 if __name__ == "__main__":
     main()
