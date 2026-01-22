@@ -13,11 +13,11 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21   
+CASHOUT_HOUR = 21   # 9 PM EST: Stop trading, sell winners
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
 
-# ✅ CITIES with Timezone Offsets (for midnight filtering)
+# ✅ CITIES with Local Timezone Offsets
 CITIES = [
     { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY", "emoji": "🎷", "tz_offset": -6 },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW", "emoji": "🍕", "tz_offset": -6 },
@@ -26,6 +26,7 @@ CITIES = [
     { "name": "AUSTIN",  "lat": 30.19, "lon": -97.67,  "ticker": "KXHIGHAUS",   "airport": "KAUS", "emoji": "🎸", "tz_offset": -6 }
 ]
 
+# RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
@@ -116,7 +117,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V43 (Local Sync)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V44 (Full Visibility)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -125,29 +126,19 @@ def get_target_date_str():
 # --- FORECASTING & HISTORY ---
 
 def get_today_high_so_far(airport_code, tz_offset):
-    """Checks observations since local midnight using station-specific offset"""
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         url = f"https://api.weather.gov/stations/{airport_code.upper()}/observations"
         res = requests.get(url, headers=headers).json()
-        
-        # Local "Today" calculation
         local_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
         today_local = local_now.date()
         obs_temps = []
-        
         for obs in res['features']:
-            # Convert UTC timestamp from API to City's Local Time
             utc_time = datetime.fromisoformat(obs['properties']['timestamp'].replace('Z', '+00:00'))
             local_time = utc_time + timedelta(hours=tz_offset)
-            
-            # Only count if it happened on Today's local calendar date
             if local_time.date() == today_local:
                 temp_c = obs['properties']['temperature']['value']
-                if temp_c is not None:
-                    temp_f = (temp_c * 9/5) + 32
-                    obs_temps.append(temp_f)
-        
+                if temp_c is not None: obs_temps.append((temp_c * 9/5) + 32)
         return max(obs_temps) if obs_temps else 0
     except: return 0
 
@@ -155,8 +146,7 @@ def get_nws_forecast(lat, lon):
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
-        f_url = p_res['properties']['forecast']
-        grid = requests.get(f_url, headers=headers).json()
+        grid = requests.get(p_res['properties']['forecast'], headers=headers).json()
         for p in grid['properties']['periods']:
             if p['isDaytime']: return p['temperature']
     except: pass
@@ -166,10 +156,8 @@ def get_nws_hourly_forecast(lat, lon):
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
-        f_url = p_res['properties']['forecastHourly']
-        grid = requests.get(f_url, headers=headers).json()
-        periods = grid['properties']['periods']
-        temps = [p['temperature'] for p in periods[:18]]
+        grid = requests.get(p_res['properties']['forecastHourly'], headers=headers).json()
+        temps = [p['temperature'] for p in grid['properties']['periods'][:18]]
         return max(temps) if temps else None
     except: return None
 
@@ -182,8 +170,9 @@ def execute_buy(client, market, qty, price, target_side, distance, safe_forecast
         if resp.status_code == 201:
             current_bankroll = update_city_stats(city_meta['name'], 0)
             log_trade_csv(city_meta['name'], market['ticker'], safe_forecast, 0, distance, price, qty, f"BUY {target_side.upper()}", 0, current_bankroll)
-            fields = [{"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True}, {"name": "Contract", "value": f"`{market['ticker']}`", "inline": True}, {"name": "Order", "value": f"Buy **{qty}x {target_side.upper()}** @ {price}¢", "inline": False}, {"name": "Stats", "value": f"Forecast {safe_forecast:.1f}° (Dist {distance:.1f}°)", "inline": False}, {"name": "City Bankroll", "value": f"${current_bankroll/100:.2f}", "inline": True}]
+            fields = [{"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True}, {"name": "Order", "value": f"Buy **{qty}x {target_side.upper()}** @ {price}¢", "inline": False}, {"name": "Stats", "value": f"Forecast {safe_forecast:.1f}° (Diff {distance:.1f}°)", "inline": True}]
             send_rich_discord_alert("🚀 BUY ORDER EXECUTED", 3447003, fields)
+            print(f"   ✅ SUCCESS: Bought {qty}x {market['ticker']}")
     except: pass
 
 def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
@@ -194,8 +183,9 @@ def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
         if resp.status_code == 201:
             new_total = update_city_stats(city_meta['name'], gross_pnl_cents)
             log_trade_csv(city_meta['name'], ticker, "N/A", 0, 0, sell_price, qty, "SELL", gross_pnl_cents, new_total)
-            fields = [{"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True}, {"name": "Reason", "value": reason, "inline": True}, {"name": "Result", "value": f"Sold {qty}x @ {sell_price}¢", "inline": False}, {"name": "PnL", "value": f"**${gross_pnl_cents/100:.2f}**", "inline": True}]
+            fields = [{"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True}, {"name": "Reason", "value": reason, "inline": True}, {"name": "PnL", "value": f"**${gross_pnl_cents/100:.2f}**", "inline": True}]
             send_rich_discord_alert(f"🤑 POSITION CLOSED", 5763719, fields)
+            print(f"   ✅ SOLD: {ticker} ({reason})")
     except: pass
 
 def manage_risk(client, city_ticker, current_forecast):
@@ -208,55 +198,44 @@ def manage_risk(client, city_ticker, current_forecast):
             except: continue
             diff = abs(current_forecast - strike)
             ob = client.get_orderbook(pos['ticker'])
-            if not ob: continue
-            current_bid = ob['yes'][0][0] if ob['yes'] else 0
-            if diff > 1.0: execute_sell(client, pos['ticker'], pos['position'], current_bid, pos.get('average_price', 0), "Drifted Outside Range")
+            if ob and diff > 1.1: execute_sell(client, pos['ticker'], pos['position'], ob['yes'][0][0] if ob['yes'] else 0, pos.get('average_price', 0), "Forecast Drifted")
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V43 Local Sync)...")
+    print("🚀 Bot Starting (V44 Full Visibility)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
-    current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
     
     try:
         client = KalshiClient()
         track_portfolio_value(client)
         if client.get_balance() < MIN_BALANCE_CENTS: return
-        
-        if current_est >= 21: # 9 PM EST
-            liquidate_winners = client.get_positions()
-            for p in liquidate_winners:
+        if (datetime.utcnow().hour - 5) % 24 >= 21: 
+            for p in client.get_positions():
                 ob = client.get_orderbook(p['ticker'])
                 if ob and ob['yes']: execute_sell(client, p['ticker'], p['position'], ob['yes'][0][0], p.get('average_price', 0), "Night Cashout")
             return
-        
         all_positions = client.get_positions()
     except Exception as e: print(f"❌ Error: {e}"); return
 
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
-        nws = get_nws_forecast(city['lat'], city['lon'])
-        hourly = get_nws_hourly_forecast(city['lat'], city['lon'])
+        nws, hourly = get_nws_forecast(city['lat'], city['lon']), get_nws_hourly_forecast(city['lat'], city['lon'])
         high_so_far = get_today_high_so_far(city['airport'], city['tz_offset'])
         
-        nws_str = f"{nws}°" if nws else "N/A"
-        hourly_str = f"{hourly}°" if hourly else "N/A"
-        
         if not nws and not hourly: continue
-        
         future_high = (nws + hourly) / 2 if (nws and hourly) else (nws or hourly)
         safe_forecast = max(future_high, high_so_far)
         
-        # ✅ RESTORED LABELS: Shows Daily, Hourly, and Historical breakdown
-        print(f"   🎯 Logic: Daily {nws_str} | Hourly {hourly_str} | Hist {high_so_far:.1f}°")
-        print(f"   ✅ Final Target High: {safe_forecast:.1f}°")
+        print(f"   🎯 Thought: Daily {nws}° | Hourly {hourly}° | Hist {high_so_far:.1f}°")
+        print(f"   ✅ Final Target: {safe_forecast:.1f}°")
         
         manage_risk(client, city['ticker'], safe_forecast)
-        
         has_pos = any(p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker'] for p in all_positions)
         
-        try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
+        try: 
+            markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
+            print(f"   📊 API returned {len(markets)} total markets.")
         except: continue
 
         for market in markets:
@@ -269,22 +248,26 @@ def main():
             target_side = "none"
             
             if diff <= 0.6: 
-                if not has_pos: target_side = "yes"
-            elif diff >= 1.8: target_side = "no"
-            else: continue
+                if not has_pos: target_side, msg = "yes", f"🎯 BULLSEYE: {ticker} is within 0.6°."
+                else: print(f"   ⏭️  SKIP YES: {ticker} matches, but already holding a position."); continue
+            elif diff >= 1.8: target_side, msg = "no", f"🛡️ TARGET NO: {ticker} is a safe miss."
+            else: print(f"   🚧 SKIP: {ticker} ({strike}°) is in Coin Flip Zone (Diff {diff:.1f}°)."); continue
 
+            print(f"   🔎 Checking {ticker} [{target_side.upper()}]...")
             ob = client.get_orderbook(ticker)
             if not ob: continue
             
             price = 0
             if target_side == "yes":
                 if ob['no']: price = 100 - ob['no'][0][0]
-                else: continue
+                else: print("   ❌ No Sellers for YES"); continue
             else: 
                 if ob['yes']: price = 100 - ob['yes'][0][0]
-                else: continue
+                else: print("   ❌ No Sellers for NO"); continue
 
-            if price < MIN_PRICE or price > MAX_PRICE: continue
+            if price < MIN_PRICE or price > MAX_PRICE:
+                print(f"   ❌ Price {price}¢ is outside safe zone."); continue
+            
             qty = LOW_CONF_COUNT
             if diff < 0.3: qty = MED_CONF_COUNT 
             if diff > 3.0: qty = HIGH_CONF_COUNT 
