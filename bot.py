@@ -145,26 +145,9 @@ def log_trade_csv(city_name, ticker, forecast, strike, gap, price, qty, action, 
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), city_name, action, ticker, qty, price_str, pnl_str, bankroll_str, forecast_str, gap_str])
 
 def track_portfolio_value(client):
-    """Logs total account value (Cash + Equity) to history file."""
     try:
         balance = client.get_balance()
-        positions = client.get_positions()
-        
-        # Calculate Equity (Very rough estimate using Last Price or Cost Basis)
-        # Kalshi API doesn't give 'current value' easily, so we use cost basis for now
-        # or simplified assumption: Cash + (Positions * 50c estimate? No, use cost).
-        # Let's use Balance (Cash) as the main metric for "Realized" value.
-        # If you want Unrealized, we'd need to fetch current bid for every position.
-        # For speed, let's log CASH BALANCE (Realized PnL).
-        
-        # NOTE: A better metric for 'Account Value' requires summing (Qty * Current_Bid)
-        equity_cents = 0
-        for pos in positions:
-            # We skip 'checking price' loop to save API calls, just use Balance for now
-            # If you want true equity, we can add it, but it slows down the bot.
-            pass
-            
-        total_value_cents = balance # + equity_cents
+        total_value_cents = balance 
         
         file_exists = os.path.isfile(PORTFOLIO_FILE)
         with open(PORTFOLIO_FILE, "a", newline="") as f:
@@ -179,37 +162,28 @@ def track_portfolio_value(client):
 # --- CEO REPORT GENERATION ---
 
 def generate_trend_graph():
-    """Reads portfolio history and creates a trendline image."""
-    dates = []
-    values = []
-    
+    dates, values = [], []
     if not os.path.exists(PORTFOLIO_FILE): return None
-    
     try:
         with open(PORTFOLIO_FILE, 'r') as f:
             reader = csv.reader(f)
-            next(reader, None) # Skip header
+            next(reader, None)
             for row in reader:
-                dates.append(row[0]) # String date
+                dates.append(row[0])
                 values.append(float(row[1]))
-        
         if not values: return None
 
-        # Create Plot
         plt.figure(figsize=(10, 5))
         plt.plot(values, marker='o', linestyle='-', color='#00d2be', linewidth=2)
         plt.title('Portfolio Value Trend', color='white')
         plt.xlabel('Time', color='white')
         plt.ylabel('Value ($)', color='white')
-        
-        # Dark Mode Styling
         plt.gca().set_facecolor('#2f3136')
         plt.gcf().patch.set_facecolor('#2f3136')
         plt.tick_params(axis='x', colors='white')
         plt.tick_params(axis='y', colors='white')
         plt.grid(color='#40444b', linestyle='--')
         
-        # Save
         filename = "chart.png"
         plt.savefig(filename, bbox_inches='tight')
         plt.close()
@@ -219,16 +193,19 @@ def generate_trend_graph():
         return None
 
 def send_daily_report(client, current_balance):
-    """Compiles the Daily PnL, City Stats, and Graph into one message."""
     print("--- 📊 Generating CEO Report ---")
     
-    # 1. Load City Stats
+    # ⚠️ CRITICAL: Uses a Different Webhook for the Report Channel
+    webhook = os.getenv("DISCORD_REPORT_WEBHOOK_URL")
+    if not webhook: 
+        print("   ⚠️ No Report Webhook found. Skipping.")
+        return
+
     city_stats = {}
     if os.path.exists(STATS_FILE):
         with open(STATS_FILE, 'r') as f:
             city_stats = json.load(f)
             
-    # 2. Format City Text
     stats_text = ""
     for city in CITIES:
         pnl = city_stats.get(city['name'], 0)
@@ -238,42 +215,33 @@ def send_daily_report(client, current_balance):
         
     if not stats_text: stats_text = "No trades recorded yet."
 
-    # 3. Generate Graph
     chart_file = generate_trend_graph()
     
-    # 4. Send to Discord (Multipart Request)
-    webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook: return
-
-    # Embed Data
     embed = {
         "title": "📊 Daily CEO Report",
         "description": f"**Account Value:** ${current_balance/100:.2f}\n\n**🌍 City Performance (All-Time):**\n{stats_text}",
-        "color": 3447003, # Blue
+        "color": 3447003, 
         "image": {"url": "attachment://chart.png"},
         "timestamp": datetime.utcnow().isoformat()
     }
 
-    # Multipart Form Data
     files = {}
     if chart_file:
         files["file"] = (chart_file, open(chart_file, "rb"))
         
-    payload = {"embeds": [embed]}
-    
-    # We have to send payload as JSON string in 'payload_json' field when using files
-    requests.post(webhook, data={"payload_json": json.dumps(payload)}, files=files)
+    requests.post(webhook, data={"payload_json": json.dumps({"embeds": [embed]})}, files=files)
     print("✅ CEO Report Sent.")
 
-# --- DISCORD ALERTS (STANDARD) ---
+# --- DISCORD ALERTS (TRADES) ---
 
 def send_rich_discord_alert(title, color, fields):
+    # ⚠️ CRITICAL: Uses the Standard Webhook for Trades
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
     payload = {
         "embeds": [{
             "title": title, "color": color, "fields": fields,
-            "footer": { "text": "Kalshi Bot V25" }, "timestamp": datetime.utcnow().isoformat()
+            "footer": { "text": "Kalshi Bot V26" }, "timestamp": datetime.utcnow().isoformat()
         }]
     }
     requests.post(webhook, json=payload)
@@ -409,7 +377,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (CEO Report V25)...")
+    print("🚀 Bot Starting (Dual-Channel V26)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
@@ -420,10 +388,10 @@ def main():
     
     try:
         client = KalshiClient()
-        current_balance = track_portfolio_value(client) # Logs balance to CSV
+        current_balance = track_portfolio_value(client) 
         if current_balance < MIN_BALANCE_CENTS: return
         
-        # --- CEO REPORT CHECK (1 AM EST) ---
+        # --- REPORTING (To Second Channel) ---
         if current_est == REPORT_HOUR:
             last_report = ""
             if os.path.exists(REPORT_TRACKER):
