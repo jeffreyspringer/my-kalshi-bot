@@ -2,8 +2,8 @@ name: Daily PnL Report
 
 on:
   schedule:
-    # Runs at 1 AM EST (which is 06:00 UTC)
-    - cron: '0 6 * * *'
+    # Runs at 11 PM EST (which is 04:00 UTC)
+    - cron: '0 4 * * *'
   workflow_dispatch:  # Allows manual button press
 
 jobs:
