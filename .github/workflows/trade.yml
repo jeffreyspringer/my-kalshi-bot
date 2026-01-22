@@ -29,7 +29,7 @@ jobs:
           # Defaults to TRUE if you haven't set this variable yet
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }} 
         # The "-u" flag is CRITICAL. It forces logs to show up immediately.
-        run: python -u bot.py
+        run: python -u debug.py
 
       - name: Commit Trade Log
         # This saves the CSV file back to your repo if a trade happened
