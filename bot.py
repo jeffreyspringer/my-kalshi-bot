@@ -12,13 +12,13 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-# --- CONFIGURATION: CITY LIST ---
-# Updated Tickers based on Live 2026 Kalshi Data
+
+# ✅ UPDATED TICKERS (Live 2026 Format)
 CITIES = [
-    { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },   # Working
+    { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHCHI" },  # Fixed (Removed T)
     { "name": "MIAMI", "lat": 25.80, "lon": -80.29, "ticker": "KXHIGHMIA" },    # Fixed (Removed T)
-    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA" },# Working
+    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA" },
     { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHAUS" }    # Fixed (Removed T)
 ]
 
@@ -48,7 +48,7 @@ class KalshiClient:
         timestamp = str(int(time.time() * 1000))
         msg = f"{timestamp}{method}/trade-api/v2{path}"
         if body:
-            msg += json.dumps(body, separators=(',', ':')) # Minify JSON for signing
+            msg += json.dumps(body, separators=(',', ':'))
 
         signature = self.private_key.sign(
             msg.encode('utf-8'),
@@ -77,11 +77,6 @@ class KalshiClient:
         res.raise_for_status()
         return res.json().get("market_positions", [])
 
-    def get_market(self, ticker):
-        res = self._req("GET", f"/markets/{ticker}")
-        if res.status_code != 200: return None
-        return res.json().get("market")
-
     def get_orderbook(self, ticker):
         res = self._req("GET", f"/markets/{ticker}/orderbook")
         if res.status_code != 200: return None
@@ -98,7 +93,6 @@ class KalshiClient:
             "no_price": price if side == "no" else 0,
             "client_order_id": str(uuid.uuid4())
         }
-        # Clean up price (API requires only one price set)
         if side == "yes": del body["no_price"]
         else: del body["yes_price"]
         
@@ -118,15 +112,12 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
 def get_forecasts(lat, lon):
-    # OM
-    om_temp = None
+    om_temp, nws_temp = None, None
     try:
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
         om_temp = requests.get(url).json()['daily']['temperature_2m_max'][0]
     except: pass
 
-    # NWS
-    nws_temp = None
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
@@ -141,7 +132,7 @@ def get_forecasts(lat, lon):
     return om_temp, nws_temp
 
 def main():
-    print("🚀 Bot Starting (Raw Mode)...")
+    print("🚀 Bot Starting (Verbose Mode)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -162,29 +153,16 @@ def main():
         
         safe_forecast = min(om, nws)
         
-        # We need to find active markets. Since we don't have a search endpoint in raw mode easily,
-        # we will iterate striking prices around the forecast.
-        # Efficient hack: Check tickers from Forecast - 5 to Forecast + 5
-        base_strike = int(safe_forecast)
-        potential_strikes = range(base_strike - 10, base_strike + 10)
-        
-        # Get active markets is hard without SDK search. 
-        # Actually, let's just use the known ticker series pattern.
-        # Example: KXHIGHTNOLA-26JAN24-T80
-        # This is hard to guess. 
-        # FALLBACK: We rely on the SERIES ticker? No, we need specific markets.
-        # For simplicity in 'Raw Mode', we might skip the complicated search 
-        # and just try to fetch the specific market if we knew the format.
-        # BUT: Kalshi V2 allows fetching markets by series_ticker.
-        
         try:
             res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
             markets = res.json().get("markets", [])
         except: 
-            print("   Failed to fetch markets.")
+            print("   ⚠️ Failed to fetch markets.")
             continue
 
-        if not markets: print("   No markets."); continue
+        if not markets: 
+            print("   ⚠️ No active markets found (Check Ticker).")
+            continue
 
         for market in markets:
             try:
@@ -192,25 +170,33 @@ def main():
             except: continue
 
             gap = safe_forecast - strike
-            if gap < 2.0: continue # Strict gap check
+            
+            # --- VERBOSE LOGGING START ---
+            if gap < 2.0: 
+                print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small (Need 2.0+).")
+                continue 
+            # -----------------------------
             
             qty = LOW_CONF_COUNT
             if gap >= 5.0: qty = HIGH_CONF_COUNT
             elif gap >= 3.0: qty = MED_CONF_COUNT
             
-            # Check Balance/Positions
             positions = client.get_positions()
             curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
             qty = min(qty, MAX_TOTAL_POS - curr_pos)
-            if qty <= 0: continue
             
-            # Check Price
+            if qty <= 0: 
+                print(f"   Skipping {market['ticker']}: Max position reached.")
+                continue
+
             ob = client.get_orderbook(market['ticker'])
             if not ob or not ob['no']: continue
             best_no_bid = ob['no'][0][0]
             buy_yes_price = 100 - best_no_bid
             
-            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: continue
+            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE:
+                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ outside range.")
+                continue
             
             if buy_yes_price < (75 - FEE_BUFFER):
                 print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} @ {buy_yes_price}¢")
@@ -220,9 +206,11 @@ def main():
                         log_trade(market['ticker'], safe_forecast, strike, gap, buy_yes_price, qty, "BUY")
                         send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} @ {buy_yes_price}¢")
                     else:
-                        print(f"   Order Failed: {resp.text}")
+                        print(f"   ❌ Order Failed: {resp.text}")
                 except Exception as e:
-                    print(f"   Order Error: {e}")
+                    print(f"   ❌ Order Error: {e}")
+            else:
+                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ too expensive (Target < {75-FEE_BUFFER}¢).")
 
 if __name__ == "__main__":
     main()
