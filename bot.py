@@ -52,14 +52,21 @@ class KalshiClient:
     def _req(self, method, path, body=None):
         timestamp = str(int(time.time() * 1000))
         
-        # ✅ FIX: Canonical JSON (Sorted Keys + No Spaces)
+        # 1. Prepare Body: Compact JSON (No spaces)
         json_str = ""
         if body:
-            json_str = json.dumps(body, sort_keys=True, separators=(',', ':'))
+            # separators=(',', ':') removes whitespace. This is crucial.
+            json_str = json.dumps(body, separators=(',', ':'))
             
-        # Sign the EXACT string we are about to send
+        # 2. Build String to Sign
+        # Format: timestamp + method + /trade-api/v2 + path + body
         msg_str = f"{timestamp}{method}/trade-api/v2{path}{json_str}"
         
+        # 🔍 DEBUG: Print the string we are signing (masked for safety)
+        if method == "POST":
+            print(f"   🔐 Signing String: {timestamp}{method}/trade-api/v2{path}{{...json...}}")
+
+        # 3. Sign it
         signature = self.private_key.sign(
             msg_str.encode('utf-8'),
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
@@ -78,11 +85,10 @@ class KalshiClient:
         if method == "GET": 
             return self.session.get(url, headers=headers, timeout=10)
         
-        # ✅ FIX: Send the string as raw 'data' bytes
-        return self.session.post(url, headers=headers, data=json_str.encode('utf-8'), timeout=10)
+        # 4. Send the EXACT string we signed
+        return self.session.post(url, headers=headers, data=json_str, timeout=10)
 
     def place_order(self, ticker, action, side, count, price):
-        # Explicit types ensure 'price' doesn't become a float (e.g. 96.0)
         body = {
             "action": action, 
             "count": int(count), 
@@ -97,16 +103,15 @@ class KalshiClient:
         res = self._req("POST", "/portfolio/orders", body)
         
         if res.status_code == 201:
-            print(f"   ✅ ORDER SUCCESS: {ticker} @ {price}¢ [ID: {res.json().get('order_id')}]")
+            print(f"   ✅ ORDER SUCCESS: {ticker} @ {price}¢")
         else:
             print(f"   ❌ REJECTED: {res.status_code}")
-            # Print the Exact string we tried to sign/send
-            print(f"   ⚠️ Payload Sent: {json.dumps(body, sort_keys=True, separators=(',', ':'))}")
+            # If rejected, print the raw response to see specific Kalshi complaints
             print(f"   ⚠️ Response: {res.text}")
             
         return res
 
-# --- UTILS (No changes) ---
+# --- UTILS ---
 def get_today_high_so_far(airport_code, tz_offset):
     try:
         headers = {'User-Agent': '(KalshiBot)'}
@@ -124,7 +129,7 @@ def get_today_high_so_far(airport_code, tz_offset):
     except: return 0
 
 def main():
-    print("🚀 Bot Starting (V50 Canonical JSON)...")
+    print("🚀 Bot Starting (V51 Glass Box)...")
     client = KalshiClient()
     target_date_str = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%y%b%d").upper()
     
@@ -132,6 +137,8 @@ def main():
         bal_res = client._req("GET", "/portfolio/balance")
         if bal_res.status_code == 200:
             print(f"💰 Account Balance: ${bal_res.json().get('balance', 0)/100:.2f}")
+        else:
+            print(f"⚠️ Balance Check Failed: {bal_res.status_code}")
     except: pass
 
     for city in CITIES:
