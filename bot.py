@@ -5,7 +5,7 @@ import csv
 import time
 import json
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -13,19 +13,19 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
 
-# ✅ LIVE 2026 TICKER FORMATS
+# ✅ CITIES WITH AIRPORT CODES (Required for LAMP)
 CITIES = [
-    { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },
-    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHCHI" },  
-    { "name": "MIAMI", "lat": 25.80, "lon": -80.29, "ticker": "KXHIGHMIA" },    
-    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA" },
-    { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHAUS" }    
+    { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY" },
+    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW" },
+    { "name": "MIAMI",   "lat": 25.80, "lon": -80.29,  "ticker": "KXHIGHMIA",   "airport": "KMIA" },
+    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA",  "airport": "KSEA" },
+    { "name": "AUSTIN",  "lat": 30.19, "lon": -97.67,  "ticker": "KXHIGHAUS",   "airport": "KAUS" }
 ]
 
 # RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
-PROFIT_TAKE_PRICE = 92      # Sell automatically if bid is this high
+PROFIT_TAKE_PRICE = 92      
 FEE_BUFFER = 3
 MIN_PRICE = 20
 MAX_PRICE = 80
@@ -111,13 +111,15 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
             writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
+# --- FORECASTING ENGINES ---
+
 def get_nws_forecast(lat, lon):
+    """Fetches the official NWS Day High."""
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
         f_url = p_res['properties']['forecast']
         grid = requests.get(f_url, headers=headers).json()
-        # Find the first 'Daytime' period (High Temp)
         for p in grid['properties']['periods']:
             if p['isDaytime']:
                 return p['temperature']
@@ -125,17 +127,46 @@ def get_nws_forecast(lat, lon):
         print(f"   ⚠️ NWS Error: {e}")
     return None
 
+def get_lamp_forecast(airport_code):
+    """Fetches GFS LAMP data and finds the Max Temp for the next 18 hours."""
+    try:
+        # LAMP data is a fixed-width text file
+        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code}.txt"
+        res = requests.get(url)
+        if res.status_code != 200: return None
+        
+        lines = res.text.split('\n')
+        utc_line, tmp_line = None, None
+        
+        # Parse the weird text format
+        for line in lines:
+            if line.startswith("UTC"): utc_line = line
+            if line.startswith("TMP"): tmp_line = line
+            
+        if not utc_line or not tmp_line: return None
+        
+        # Extract numbers (skipping the label "UTC" and "TMP")
+        # Python's split() handles multiple spaces automatically
+        utc_hours = [int(x) for x in utc_line.split()[1:]]
+        temps = [int(x) for x in tmp_line.split()[1:]]
+        
+        # We only want temps for "Today" (before the UTC hour rolls over significantly)
+        # Simple heuristic: Take the max of the first 15 hours of the forecast
+        valid_temps = temps[:15]
+        return max(valid_temps)
+        
+    except Exception as e:
+        print(f"   ⚠️ LAMP Error: {e}")
+        return None
+
 def check_profits(client):
     print("--- 💰 Checking for Profit Opportunities ---")
     try:
         positions = client.get_positions()
         for pos in positions:
             if pos['position'] <= 0: continue
-            
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
-            
-            # Look for the best bid (Highest price someone will pay us)
             best_bid = ob['yes'][0][0]
             
             if best_bid >= PROFIT_TAKE_PRICE:
@@ -145,13 +176,11 @@ def check_profits(client):
                     if resp.status_code == 201:
                         log_trade(pos['ticker'], "PROFIT", "N/A", 0, best_bid, pos['position'], "SELL")
                         send_discord_alert(f"💰 **Profit Taken!** Sold {pos['position']}x {pos['ticker']} @ **{best_bid}¢**")
-                except Exception as e:
-                    print(f"   Sell Error: {e}")
-    except Exception as e:
-        print(f"   Profit Check Error: {e}")
+                except: pass
+    except: pass
 
 def main():
-    print("🚀 Bot Starting (NWS Only Mode)...")
+    print("🚀 Bot Starting (Dual-Engine Mode)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -159,25 +188,35 @@ def main():
         balance = client.get_balance()
         print(f"✅ Balance: {balance}¢")
         if balance < MIN_BALANCE_CENTS: return
-        
-        # 1. Run Profit Taker
         check_profits(client)
-        
     except Exception as e:
         print(f"❌ Login Failed: {e}")
         return
 
-    # 2. Run Scanner
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
-        print(f"\n🔎 {city['name']}...")
-        forecast = get_nws_forecast(city['lat'], city['lon'])
-        print(f"   Forecast (NWS): {forecast}°")
+        print(f"\n🔎 {city['name']} ({city['airport']})...")
         
-        if not forecast: 
-            print("   ⚠️ No forecast available.")
+        # 1. Get Engines
+        nws = get_nws_forecast(city['lat'], city['lon'])
+        lamp = get_lamp_forecast(city['airport'])
+        
+        print(f"   Forecasts: NWS {nws}° | LAMP {lamp}°")
+        
+        if not nws: 
+            print("   ⚠️ NWS Down. Skipping.")
             continue
-        
+            
+        # 2. The "Consensus" Logic
+        # If LAMP is available, use the AVERAGE of NWS and LAMP for safety.
+        # If LAMP is missing, trust NWS.
+        if lamp:
+            safe_forecast = (nws + lamp) / 2
+        else:
+            safe_forecast = nws
+            
+        print(f"   🎯 Target: {safe_forecast:.1f}°")
+
         try:
             res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
             markets = res.json().get("markets", [])
@@ -186,7 +225,7 @@ def main():
             continue
 
         if not markets: 
-            print("   ⚠️ No active markets found.")
+            print("   ⚠️ No markets.")
             continue
 
         for market in markets:
@@ -194,11 +233,10 @@ def main():
                 strike = float(market['ticker'].split('-T')[-1])
             except: continue
 
-            gap = forecast - strike
+            gap = safe_forecast - strike
             
-            if gap < 2.0: 
-                print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small.")
-                continue 
+            # Strict Filtering
+            if gap < 2.0: continue 
             
             qty = LOW_CONF_COUNT
             if gap >= 5.0: qty = HIGH_CONF_COUNT
@@ -208,32 +246,26 @@ def main():
             curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
             qty = min(qty, MAX_TOTAL_POS - curr_pos)
             
-            if qty <= 0: 
-                print(f"   Skipping {market['ticker']}: Max position reached.")
-                continue
+            if qty <= 0: continue
 
             ob = client.get_orderbook(market['ticker'])
             if not ob or not ob['no']: continue
             best_no_bid = ob['no'][0][0]
             buy_yes_price = 100 - best_no_bid
             
-            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE:
-                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ outside range.")
-                continue
+            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: continue
             
             if buy_yes_price < (75 - FEE_BUFFER):
                 print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} @ {buy_yes_price}¢")
                 try:
                     resp = client.place_order(market['ticker'], "buy", "yes", qty, buy_yes_price)
                     if resp.status_code == 201:
-                        log_trade(market['ticker'], forecast, strike, gap, buy_yes_price, qty, "BUY")
+                        log_trade(market['ticker'], safe_forecast, strike, gap, buy_yes_price, qty, "BUY")
                         send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} @ {buy_yes_price}¢")
                     else:
                         print(f"   ❌ Order Failed: {resp.text}")
                 except Exception as e:
                     print(f"   ❌ Order Error: {e}")
-            else:
-                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ too expensive.")
 
 if __name__ == "__main__":
     main()
