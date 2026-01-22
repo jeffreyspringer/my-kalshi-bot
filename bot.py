@@ -142,7 +142,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V30 (Debug)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V31 (Detective)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -268,7 +268,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V30 Chatty)...")
+    print("🚀 Bot Starting (V31 Detective)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -293,34 +293,40 @@ def main():
         lamp = get_lamp_forecast(city['airport'])
         if not nws and not lamp: print("   ⚠️ No Weather Data"); continue
         
+        # 🔍 NEW: Print individual forecasts before averaging
+        nws_str = f"{nws}°" if nws else "N/A"
+        lamp_str = f"{lamp}°" if lamp else "N/A"
         safe_forecast = (nws + lamp) / 2 if (nws and lamp) else (nws or lamp)
-        print(f"   🎯 Forecast: {safe_forecast:.1f}°")
+        print(f"   🎯 Forecast: {safe_forecast:.1f}° (NWS: {nws_str} | LAMP: {lamp_str})")
         
         manage_risk(client, city['ticker'], safe_forecast)
         
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: print("   ⚠️ API Error fetching markets"); continue
         
-        if not markets: print("   ⚠️ No Open Markets Found"); continue
+        # 🔍 NEW: Debug Raw Market Count
+        print(f"   [DEBUG] API returned {len(markets)} markets total.")
+        
+        if not markets: continue
 
-        count_checked = 0
+        count_for_today = 0
         for market in markets:
             if target_date_str not in market['ticker']: continue
-            count_checked += 1
+            count_for_today += 1
             
             try: strike = float(market['ticker'].split('-T')[-1])
             except: continue
             
             distance = abs(safe_forecast - strike)
             
-            # --- DEBUG LOGGING ---
-            # Explicitly tell us why it's skipping
-            if distance > 1.5 and distance < 3.0:
-                print(f"   Skipping {strike}°: In Uncertainty Zone (Dist {distance:.1f})")
-                continue
-            
+            # Smart Betting Logic
             target_side = "no"
             if distance <= 1.5: target_side = "yes"
+            
+            # Why we don't check "Both Sides":
+            # If distance is > 3.0, "Yes" is a Hail Mary pass (long shot).
+            # We only bet on Probability > 60%. 
+            # If we switch to 'yes', we are betting on < 5% probability.
             
             if target_side == "no" and distance < 3.0:
                 print(f"   Skipping {strike}°: Too risky for NO (Dist {distance:.1f})")
@@ -344,10 +350,9 @@ def main():
                 price = 100 - ob['yes'][0][0]
 
             if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   Skipping {strike}°: Bad Price ({price}¢)")
+                print(f"   Skipping {strike}°: Price {price}¢ is outside safe zone ({MIN_PRICE}-{MAX_PRICE}¢)")
                 continue
 
-            # Execution logic...
             qty = LOW_CONF_COUNT
             if target_side == "yes": qty = MED_CONF_COUNT
             if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT
@@ -355,8 +360,8 @@ def main():
             print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side}] @ {price}¢")
             execute_buy(client, market, qty, price, target_side, distance, safe_forecast)
         
-        if count_checked == 0:
-            print(f"   ⚠️ Found markets, but none matched date '{target_date_str}'")
+        if count_for_today == 0:
+            print(f"   ⚠️ API returned {len(markets)} markets, but NONE matched date '{target_date_str}'")
 
 if __name__ == "__main__":
     main()
