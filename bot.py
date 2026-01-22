@@ -136,7 +136,7 @@ def main():
     # ------------------------------------------------
 
     try:
-        config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
+        config = kalshi_python.Configuration(host="https://trading-api.kalshi.com/trade-api/v2")
         config.api_key_id = api_key_id
         config.private_key_pem = private_key_pem
         
