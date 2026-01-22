@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
 
-# ✅ UPDATED TICKERS (Live 2026 Format)
+# ✅ LIVE 2026 TICKER FORMATS
 CITIES = [
     { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHCHI" },  
@@ -111,24 +111,19 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
             writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
-def get_forecasts(lat, lon):
-    om_temp, nws_temp = None, None
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
-        om_temp = requests.get(url).json()['daily']['temperature_2m_max'][0]
-    except: pass
-
+def get_nws_forecast(lat, lon):
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
         f_url = p_res['properties']['forecast']
         grid = requests.get(f_url, headers=headers).json()
+        # Find the first 'Daytime' period (High Temp)
         for p in grid['properties']['periods']:
             if p['isDaytime']:
-                nws_temp = p['temperature']
-                break
-    except: pass
-    return om_temp, nws_temp
+                return p['temperature']
+    except Exception as e:
+        print(f"   ⚠️ NWS Error: {e}")
+    return None
 
 def check_profits(client):
     print("--- 💰 Checking for Profit Opportunities ---")
@@ -137,15 +132,10 @@ def check_profits(client):
         for pos in positions:
             if pos['position'] <= 0: continue
             
-            # Check market price
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
             
-            # The 'yes' list is [ [price, qty], [price, qty] ... ]
-            # We want the HIGHEST price someone is willing to PAY (The Bid)
-            # Kalshi orderbook structure usually returns 'yes' side as [Bid, Ask]? 
-            # Actually raw API often gives Bids in descending order.
-            # Let's grab the best bid.
+            # Look for the best bid (Highest price someone will pay us)
             best_bid = ob['yes'][0][0]
             
             if best_bid >= PROFIT_TAKE_PRICE:
@@ -161,7 +151,7 @@ def check_profits(client):
         print(f"   Profit Check Error: {e}")
 
 def main():
-    print("🚀 Bot Starting (Full Auto Mode)...")
+    print("🚀 Bot Starting (NWS Only Mode)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -170,7 +160,7 @@ def main():
         print(f"✅ Balance: {balance}¢")
         if balance < MIN_BALANCE_CENTS: return
         
-        # 1. Run Profit Taker FIRST
+        # 1. Run Profit Taker
         check_profits(client)
         
     except Exception as e:
@@ -181,11 +171,12 @@ def main():
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
-        om, nws = get_forecasts(city['lat'], city['lon'])
-        print(f"   Forecasts: OM {om}° | NWS {nws}°")
-        if not om or not nws: continue
+        forecast = get_nws_forecast(city['lat'], city['lon'])
+        print(f"   Forecast (NWS): {forecast}°")
         
-        safe_forecast = min(om, nws)
+        if not forecast: 
+            print("   ⚠️ No forecast available.")
+            continue
         
         try:
             res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
@@ -195,7 +186,7 @@ def main():
             continue
 
         if not markets: 
-            print("   ⚠️ No active markets found (Check Ticker).")
+            print("   ⚠️ No active markets found.")
             continue
 
         for market in markets:
@@ -203,7 +194,7 @@ def main():
                 strike = float(market['ticker'].split('-T')[-1])
             except: continue
 
-            gap = safe_forecast - strike
+            gap = forecast - strike
             
             if gap < 2.0: 
                 print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small.")
@@ -235,7 +226,7 @@ def main():
                 try:
                     resp = client.place_order(market['ticker'], "buy", "yes", qty, buy_yes_price)
                     if resp.status_code == 201:
-                        log_trade(market['ticker'], safe_forecast, strike, gap, buy_yes_price, qty, "BUY")
+                        log_trade(market['ticker'], forecast, strike, gap, buy_yes_price, qty, "BUY")
                         send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} @ {buy_yes_price}¢")
                     else:
                         print(f"   ❌ Order Failed: {resp.text}")
