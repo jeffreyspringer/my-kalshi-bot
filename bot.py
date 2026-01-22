@@ -5,7 +5,7 @@ import csv
 import time
 import json
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
 
-# ✅ CITIES WITH AIRPORT CODES (Required for LAMP)
+# ✅ CITIES (Tickers + Airport Codes)
 CITIES = [
     { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY" },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW" },
@@ -25,7 +25,7 @@ CITIES = [
 # RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
-PROFIT_TAKE_PRICE = 92      
+PROFIT_TAKE_PRICE = 92      # Sell automatically if bid is this high
 FEE_BUFFER = 3
 MIN_PRICE = 20
 MAX_PRICE = 80
@@ -128,30 +128,30 @@ def get_nws_forecast(lat, lon):
     return None
 
 def get_lamp_forecast(airport_code):
-    """Fetches GFS LAMP data and finds the Max Temp for the next 18 hours."""
+    """Fetches GFS LAMP data with robust parsing."""
     try:
-        # LAMP data is a fixed-width text file
         url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code}.txt"
         res = requests.get(url)
-        if res.status_code != 200: return None
+        if res.status_code != 200: 
+            print(f"   ⚠️ LAMP Failed: {airport_code} not found (404).")
+            return None
         
         lines = res.text.split('\n')
         utc_line, tmp_line = None, None
         
-        # Parse the weird text format
+        # Robust Parsing: Strip spaces to find row headers
         for line in lines:
-            if line.startswith("UTC"): utc_line = line
-            if line.startswith("TMP"): tmp_line = line
+            clean = line.strip()
+            if clean.startswith("UTC"): utc_line = clean
+            if clean.startswith("TMP"): tmp_line = clean
             
-        if not utc_line or not tmp_line: return None
+        if not utc_line or not tmp_line: 
+            return None
         
-        # Extract numbers (skipping the label "UTC" and "TMP")
-        # Python's split() handles multiple spaces automatically
-        utc_hours = [int(x) for x in utc_line.split()[1:]]
+        # Extract numbers (split() handles variable spacing)
         temps = [int(x) for x in tmp_line.split()[1:]]
         
-        # We only want temps for "Today" (before the UTC hour rolls over significantly)
-        # Simple heuristic: Take the max of the first 15 hours of the forecast
+        # Grab max of the next 15 hours
         valid_temps = temps[:15]
         return max(valid_temps)
         
@@ -203,17 +203,16 @@ def main():
         
         print(f"   Forecasts: NWS {nws}° | LAMP {lamp}°")
         
-        if not nws: 
-            print("   ⚠️ NWS Down. Skipping.")
-            continue
-            
-        # 2. The "Consensus" Logic
-        # If LAMP is available, use the AVERAGE of NWS and LAMP for safety.
-        # If LAMP is missing, trust NWS.
-        if lamp:
+        # 2. Consensus Logic
+        if nws and lamp:
             safe_forecast = (nws + lamp) / 2
-        else:
+        elif nws:
             safe_forecast = nws
+        elif lamp:
+            safe_forecast = lamp
+        else:
+            print("   ⚠️ No data available. Skipping.")
+            continue
             
         print(f"   🎯 Target: {safe_forecast:.1f}°")
 
@@ -225,7 +224,7 @@ def main():
             continue
 
         if not markets: 
-            print("   ⚠️ No markets.")
+            print("   ⚠️ No active markets.")
             continue
 
         for market in markets:
@@ -235,8 +234,11 @@ def main():
 
             gap = safe_forecast - strike
             
-            # Strict Filtering
-            if gap < 2.0: continue 
+            # --- VERBOSE LOGGING START ---
+            if gap < 2.0: 
+                print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small.")
+                continue 
+            # -----------------------------
             
             qty = LOW_CONF_COUNT
             if gap >= 5.0: qty = HIGH_CONF_COUNT
@@ -246,14 +248,18 @@ def main():
             curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
             qty = min(qty, MAX_TOTAL_POS - curr_pos)
             
-            if qty <= 0: continue
+            if qty <= 0: 
+                print(f"   Skipping {market['ticker']}: Max position reached.")
+                continue
 
             ob = client.get_orderbook(market['ticker'])
             if not ob or not ob['no']: continue
             best_no_bid = ob['no'][0][0]
             buy_yes_price = 100 - best_no_bid
             
-            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: continue
+            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: 
+                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ outside range.")
+                continue
             
             if buy_yes_price < (75 - FEE_BUFFER):
                 print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} @ {buy_yes_price}¢")
@@ -266,6 +272,8 @@ def main():
                         print(f"   ❌ Order Failed: {resp.text}")
                 except Exception as e:
                     print(f"   ❌ Order Error: {e}")
+            else:
+                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ too expensive.")
 
 if __name__ == "__main__":
     main()
