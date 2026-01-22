@@ -12,7 +12,8 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21  # 9 PM EST: Stop buying, sell winners.
+CASHOUT_HOUR = 21  # 9 PM EST
+STATS_FILE = "city_stats.json"
 
 # ✅ CITIES
 CITIES = [
@@ -99,7 +100,8 @@ class KalshiClient:
         
         return self._req("POST", "/portfolio/orders", body)
 
-# --- UTILS ---
+# --- UTILS & STATS ---
+
 def send_discord_alert(message):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if webhook: requests.post(webhook, json={"content": message})
@@ -113,15 +115,34 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
 def get_target_date_str():
-    """
-    Generates the date string for TODAY (EST) in Kalshi format.
-    Example: 26JAN25 (Year 26, Jan 25)
-    This ensures we never accidentally trade yesterday's market.
-    """
-    # Get current time in EST (UTC - 5)
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
-    # Format: YYMMMDD (e.g. 26Jan25). Then uppercase to 26JAN25.
     return est_now.strftime("%y%b%d").upper()
+
+def get_city_from_ticker(ticker):
+    """Finds which city a ticker belongs to."""
+    for city in CITIES:
+        # e.g. KXHIGHTNOLA is inside the ticker string
+        if city['ticker'].replace("KXHIGHT", "").replace("KXHIGH", "") in ticker:
+            return city['name']
+    return "UNKNOWN"
+
+def update_city_stats(city_name, pnl_cents):
+    """Updates the persistent JSON file with PnL."""
+    stats = {}
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, 'r') as f:
+                stats = json.load(f)
+        except: pass
+    
+    current_total = stats.get(city_name, 0)
+    new_total = current_total + pnl_cents
+    stats[city_name] = new_total
+    
+    with open(STATS_FILE, 'w') as f:
+        json.dump(stats, f)
+        
+    return new_total
 
 # --- FORECASTING ---
 def get_nws_forecast(lat, lon):
@@ -152,7 +173,39 @@ def get_lamp_forecast(airport_code):
         return max(temps[:15])
     except: return None
 
-# --- STRATEGY ---
+# --- TRADING LOGIC WITH PNL ---
+
+def handle_sell(client, ticker, qty, sell_price, entry_price, reason):
+    """Centralized function to handle sells and reporting."""
+    city_name = get_city_from_ticker(ticker)
+    
+    # Calculate PnL (Profit/Loss)
+    # entry_price is what we paid on avg. sell_price is what we get.
+    gross_pnl_cents = (sell_price - entry_price) * qty
+    
+    try:
+        resp = client.place_order(ticker, "sell", "yes", qty, sell_price)
+        if resp.status_code == 201:
+            # Update Stats
+            new_city_total = update_city_stats(city_name, gross_pnl_cents)
+            
+            # Format numbers for humans
+            pnl_str = f"+${gross_pnl_cents/100:.2f}" if gross_pnl_cents >= 0 else f"-${abs(gross_pnl_cents)/100:.2f}"
+            total_str = f"${new_city_total/100:.2f}"
+            emoji = "💰" if gross_pnl_cents >= 0 else "📉"
+            
+            msg = (
+                f"{emoji} **{reason}** | **{city_name}**\n"
+                f"Sold {qty}x {ticker} @ {sell_price}¢ (Entry: {entry_price}¢)\n"
+                f"**Trade PnL:** {pnl_str} | **City Total:** {total_str}"
+            )
+            log_trade(ticker, "SELL", "N/A", 0, sell_price, qty, "SELL")
+            send_discord_alert(msg)
+            print(f"   {emoji} SOLD: {ticker} (PnL: {pnl_str})")
+        else:
+            print(f"   ❌ Sell Failed: {resp.text}")
+    except Exception as e:
+        print(f"   ❌ Sell Error: {e}")
 
 def check_daytime_profits(client):
     print("--- 💰 Checking for Jackpots (>92¢) ---")
@@ -165,12 +218,8 @@ def check_daytime_profits(client):
             best_bid = ob['yes'][0][0]
             
             if best_bid >= PROFIT_TAKE_PRICE:
-                print(f"   🤑 JACKPOT! Selling {pos['ticker']} @ {best_bid}¢")
-                try:
-                    client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
-                    log_trade(pos['ticker'], "PROFIT_TAKE", "N/A", 0, best_bid, pos['position'], "SELL")
-                    send_discord_alert(f"💰 **Jackpot!** Sold {pos['ticker']} @ **{best_bid}¢**")
-                except: pass
+                entry_price = pos.get('average_price', pos.get('avg_price', 0))
+                handle_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "JACKPOT")
     except: pass
 
 def liquidate_winners(client):
@@ -185,12 +234,7 @@ def liquidate_winners(client):
             entry_price = pos.get('average_price', pos.get('avg_price', 0))
             
             if best_bid > entry_price and best_bid > 5:
-                print(f"   💸 CASHOUT: Selling {pos['ticker']} @ {best_bid}¢ (Entry: {entry_price}¢)")
-                try:
-                    client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
-                    log_trade(pos['ticker'], "NIGHT_CASHOUT", "N/A", 0, best_bid, pos['position'], "SELL")
-                    send_discord_alert(f"🌙 **Night Cashout**: Sold {pos['ticker']} @ {best_bid}¢")
-                except: pass
+                handle_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "NIGHT CASHOUT")
     except: pass
 
 def manage_risk(client, city_ticker, current_forecast):
@@ -219,27 +263,24 @@ def manage_risk(client, city_ticker, current_forecast):
                 
                 if is_profitable:
                     should_sell = True
-                    reason = f"Forecast moved & Profitable"
+                    reason = "Forecast Moved (Profit Take)"
                 elif not is_market_confident:
                     should_sell = True
-                    reason = f"STOP LOSS: Forecast moved & Low Conf"
+                    reason = "STOP LOSS (Forecast Moved)"
             
             if should_sell:
-                print(f"   ⚠️ RISK ALERT: Selling {pos['ticker']} ({reason})")
-                client.place_order(pos['ticker'], "sell", "yes", pos['position'], current_bid)
-                send_discord_alert(f"⚠️ **Risk Mgmt**: Dumped {pos['ticker']} @ {current_bid}¢. {reason}")
+                handle_sell(client, pos['ticker'], pos['position'], current_bid, entry_price, reason)
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Date Locked V22)...")
+    print("🚀 Bot Starting (Financial Tracking V23)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
     current_est = (current_utc - 5) % 24
     
-    # 🔒 DATE LOCK
     target_date_str = get_target_date_str()
-    print(f"🕒 Time: {current_est}:00 EST | 🔒 Targeting Markets for: {target_date_str}")
+    print(f"🕒 Time: {current_est}:00 EST | 🔒 Date: {target_date_str}")
     
     try:
         client = KalshiClient()
@@ -278,10 +319,7 @@ def main():
         if not markets: continue
 
         for market in markets:
-            # 🔒 DATE CHECK: Skip if ticker doesn't match today's date
-            if target_date_str not in market['ticker']:
-                # print(f"   Skipping Old/Future Market: {market['ticker']}")
-                continue
+            if target_date_str not in market['ticker']: continue
 
             try:
                 strike = float(market['ticker'].split('-T')[-1])
@@ -318,13 +356,24 @@ def main():
             
             if qty <= 0: continue
 
-            print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side.upper()}] @ {price}¢ (Dist {distance:.1f})")
+            print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side.upper()}] @ {price}¢")
             
             try:
                 resp = client.place_order(market['ticker'], "buy", target_side, qty, price)
                 if resp.status_code == 201:
                     log_trade(market['ticker'], safe_forecast, strike, distance, price, qty, f"BUY_{target_side.upper()}")
-                    send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} **{target_side.upper()}** @ {price}¢")
+                    
+                    # Fetch current stats for the buy message
+                    city_name = get_city_from_ticker(market['ticker'])
+                    current_stats = update_city_stats(city_name, 0) # Just get current, don't add
+                    total_str = f"${current_stats/100:.2f}"
+                    
+                    msg = (
+                        f"🚀 **BUY** | **{city_name}**\n"
+                        f"Bought {qty}x {market['ticker']} **[{target_side.upper()}]** @ {price}¢\n"
+                        f"**City Total PnL:** {total_str}"
+                    )
+                    send_discord_alert(msg)
             except: pass
 
 if __name__ == "__main__":
