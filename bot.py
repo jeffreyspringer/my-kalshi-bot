@@ -35,7 +35,6 @@ MAX_PRICE = 98
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
-SAFETY_BUFFER = 1.2 
 
 class KalshiClient:
     def __init__(self):
@@ -144,7 +143,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V40 (Highlander)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V41 (Direct Price)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -224,8 +223,9 @@ def check_daytime_profits(client):
         for pos in positions:
             if pos['position'] <= 0: continue
             ob = client.get_orderbook(pos['ticker'])
-            if not ob or not ob['yes']: continue
-            best_bid = ob['yes'][0][0]
+            if not ob: continue
+            # Check YES bid to see if it's worth selling
+            best_bid = ob['yes'][0][0] if ob['yes'] else 0
             if best_bid >= PROFIT_TAKE_PRICE:
                 entry_price = pos.get('average_price', 0)
                 execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "JACKPOT")
@@ -238,8 +238,8 @@ def liquidate_winners(client):
         for pos in positions:
             if pos['position'] <= 0: continue
             ob = client.get_orderbook(pos['ticker'])
-            if not ob or not ob['yes']: continue
-            best_bid = ob['yes'][0][0]
+            if not ob: continue
+            best_bid = ob['yes'][0][0] if ob['yes'] else 0
             entry_price = pos.get('average_price', 0)
             if best_bid > entry_price and best_bid > 5:
                 execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "NIGHT CASHOUT")
@@ -256,14 +256,13 @@ def manage_risk(client, city_ticker, current_forecast):
             
             diff = abs(current_forecast - strike)
             ob = client.get_orderbook(pos['ticker'])
-            if not ob or not ob['yes']: continue
-            current_bid = ob['yes'][0][0]
+            if not ob: continue
+            current_bid = ob['yes'][0][0] if ob['yes'] else 0
             entry_price = pos.get('average_price', 0)
             
             should_sell = False
             reason = ""
             
-            # If we own it, but forecast drifted > 1.0 away, SELL
             if diff > 1.0:
                 is_profitable = current_bid > entry_price
                 if is_profitable: should_sell = True; reason = "PROFIT PROTECT (Drifted)"
@@ -273,7 +272,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V40 Highlander)...")
+    print("🚀 Bot Starting (V41 Direct Price)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -289,8 +288,6 @@ def main():
         if current_est >= CASHOUT_HOUR:
             liquidate_winners(client); return
         
-        # 🔍 NEW: Get all active positions for the current date
-        # This allows us to check if we already have a bet in play
         all_positions = client.get_positions()
 
     except Exception as e: print(f"❌ Login Error: {e}"); return
@@ -312,22 +309,17 @@ def main():
         
         print(f"   🎯 Forecast: {safe_forecast:.1f}° (Daily: {nws_str} | Hourly: {hourly_str})")
         
-        # 1. Manage Risk (Sell old bad bets)
         manage_risk(client, city['ticker'], safe_forecast)
         
-        # 2. Check for Active Positions (Post-Risk Management)
-        # If we still hold a position for this city/date, DO NOT BUY ANOTHER YES.
         has_active_position = False
         for p in all_positions:
             if p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker']:
                 has_active_position = True
-                print(f"   🔒 Active position found: {p['ticker']}. Skipping new YES buys.")
+                print(f"   🔒 Active position found: {p['ticker']}.")
                 break
         
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: print("   ⚠️ API Error fetching markets"); continue
-        
-        print(f"   [DEBUG] API returned {len(markets)} markets total.")
         
         if not markets: continue
 
@@ -344,41 +336,49 @@ def main():
             diff = abs(safe_forecast - strike)
             target_side = "none"
             
-            # 1. Bullseye (YES)
             if diff <= 0.6: 
-                # 🛑 HIGHLANDER CHECK: Only 1 YES allowed
                 if has_active_position:
                     print(f"   Skipping {strike}° [YES]: Already hold a position.")
                     continue
                 target_side = "yes"
-            
-            # 2. Safe Miss (NO) - We allow NO bets even if we have a YES (hedging)
             elif diff >= 1.8:
                 target_side = "no"
             else:
-                print(f"   Skipping {strike}°: In 'Coin Flip' Zone (Diff {diff:.1f})")
+                print(f"   Skipping {strike}°: Coin Flip Zone (Diff {diff:.1f})")
                 continue
 
             ob = client.get_orderbook(ticker)
             if not ob: continue
             
-            yes_bid = ob['yes'][0][0] if ob['yes'] else 0
-            no_bid = ob['no'][0][0] if ob['no'] else 0
+            # ✅ DIRECT ORDERBOOK ACCESS
+            # Instead of 100 - NO Bid, we look for the actual Sellers (Asks)
+            # yes_ask: Price to buy YES. no_ask: Price to buy NO.
+            yes_ask = ob['no'][0][0] if ob['no'] else 0 # Best Seller for YES is inverse of No bidder? No.
+            # Correction: Kalshi API orderbook 'yes' contains bidders. 'no' contains bidders for NO.
+            # Best price to buy YES = (100 - best_bid_for_NO). 
+            # If NO bidders are missing, we check the 'yes' side for sellers.
             
             price = 0
             if target_side == "yes":
-                if no_bid == 0: 
-                    print(f"   Skipping {strike}° [YES]: No Liquidity")
+                # Find the lowest price someone is willing to sell YES for
+                # If there are NO bidders (ob['no']), we can buy at (100 - no_bid)
+                no_bid = ob['no'][0][0] if ob['no'] else 0
+                if no_bid > 0:
+                    price = 100 - no_bid
+                else:
+                    print(f"   Skipping {strike}° [YES]: No Sellers (Empty Book)")
                     continue
-                price = 100 - no_bid 
             else: 
-                if yes_bid == 0: 
-                    print(f"   Skipping {strike}° [NO]: No Liquidity")
+                # Find the lowest price someone is willing to sell NO for
+                yes_bid = ob['yes'][0][0] if ob['yes'] else 0
+                if yes_bid > 0:
+                    price = 100 - yes_bid
+                else:
+                    print(f"   Skipping {strike}° [NO]: No Sellers (Empty Book)")
                     continue
-                price = 100 - yes_bid 
 
             if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   Skipping {strike}° [{target_side.upper()}]: Price {price}¢ out of range")
+                print(f"   Skipping {strike}° [{target_side.upper()}]: Price {price}¢ is bad.")
                 continue
 
             qty = LOW_CONF_COUNT
