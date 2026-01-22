@@ -5,13 +5,14 @@ import csv
 import time
 import json
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
+CASHOUT_HOUR = 21  # 9 PM EST: Stop buying, sell winners.
 
 # ✅ CITIES
 CITIES = [
@@ -111,6 +112,17 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
             writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
+def get_target_date_str():
+    """
+    Generates the date string for TODAY (EST) in Kalshi format.
+    Example: 26JAN25 (Year 26, Jan 25)
+    This ensures we never accidentally trade yesterday's market.
+    """
+    # Get current time in EST (UTC - 5)
+    est_now = datetime.now(timezone.utc) - timedelta(hours=5)
+    # Format: YYMMMDD (e.g. 26Jan25). Then uppercase to 26JAN25.
+    return est_now.strftime("%y%b%d").upper()
+
 # --- FORECASTING ---
 def get_nws_forecast(lat, lon):
     try:
@@ -140,9 +152,10 @@ def get_lamp_forecast(airport_code):
         return max(temps[:15])
     except: return None
 
-def check_profits(client):
-    """Sells winners if they hit our profit target."""
-    print("--- 💰 Checking Profit Taking ---")
+# --- STRATEGY ---
+
+def check_daytime_profits(client):
+    print("--- 💰 Checking for Jackpots (>92¢) ---")
     try:
         positions = client.get_positions()
         for pos in positions:
@@ -152,25 +165,38 @@ def check_profits(client):
             best_bid = ob['yes'][0][0]
             
             if best_bid >= PROFIT_TAKE_PRICE:
-                print(f"   🤑 PROFIT! Selling {pos['ticker']} @ {best_bid}¢")
+                print(f"   🤑 JACKPOT! Selling {pos['ticker']} @ {best_bid}¢")
                 try:
                     client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
-                    send_discord_alert(f"💰 **Profit!** Sold {pos['ticker']} @ {best_bid}¢")
+                    log_trade(pos['ticker'], "PROFIT_TAKE", "N/A", 0, best_bid, pos['position'], "SELL")
+                    send_discord_alert(f"💰 **Jackpot!** Sold {pos['ticker']} @ **{best_bid}¢**")
+                except: pass
+    except: pass
+
+def liquidate_winners(client):
+    print(f"--- 🌙 Night Shift: Liquidating Winners ---")
+    try:
+        positions = client.get_positions()
+        for pos in positions:
+            if pos['position'] <= 0: continue
+            ob = client.get_orderbook(pos['ticker'])
+            if not ob or not ob['yes']: continue
+            best_bid = ob['yes'][0][0]
+            entry_price = pos.get('average_price', pos.get('avg_price', 0))
+            
+            if best_bid > entry_price and best_bid > 5:
+                print(f"   💸 CASHOUT: Selling {pos['ticker']} @ {best_bid}¢ (Entry: {entry_price}¢)")
+                try:
+                    client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
+                    log_trade(pos['ticker'], "NIGHT_CASHOUT", "N/A", 0, best_bid, pos['position'], "SELL")
+                    send_discord_alert(f"🌙 **Night Cashout**: Sold {pos['ticker']} @ {best_bid}¢")
                 except: pass
     except: pass
 
 def manage_risk(client, city_ticker, current_forecast):
-    """
-    Sells positions if the forecast moves against us, 
-    BUT applies 'Smart Exit' logic:
-    1. If Profitable -> SELL (Protect gains)
-    2. If NOT Profitable but High Probability (>50%) -> HOLD (Wait it out)
-    3. If NOT Profitable and Low Probability -> SELL (Stop loss)
-    """
     try:
         positions = client.get_positions()
         for pos in positions:
-            # Only check positions for THIS city
             if city_ticker not in pos['ticker']: continue
             if pos['position'] <= 0: continue
             
@@ -178,55 +204,57 @@ def manage_risk(client, city_ticker, current_forecast):
                 strike = float(pos['ticker'].split('-T')[-1])
             except: continue
             
-            # Distance from NEW forecast
             distance = abs(current_forecast - strike)
-            
-            # --- GET CURRENT MARKET DATA ---
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
-            current_bid = ob['yes'][0][0] # What we can sell for right now
+            current_bid = ob['yes'][0][0]
+            entry_price = pos.get('average_price', pos.get('avg_price', 0))
             
-            # Try to get our entry price. If missing, assume 0 (Conservative)
-            entry_price = pos.get('avg_price', 0) 
-            
-            # --- RISK LOGIC ---
             should_sell = False
             reason = ""
             
-            # Condition: Forecast has moved away (Risk is rising)
             if distance > 2.0:
                 is_profitable = current_bid > entry_price
                 is_market_confident = current_bid > 50
                 
                 if is_profitable:
                     should_sell = True
-                    reason = f"Forecast moved (Dist {distance:.1f}°) & Profitable ({current_bid}¢ > {entry_price}¢)"
-                
-                elif is_market_confident:
-                    print(f"   ✋ HOLDING {pos['ticker']}: Forecast moved (Dist {distance:.1f}°), but Market Confidence High ({current_bid}%).")
-                    should_sell = False
-                
-                else:
+                    reason = f"Forecast moved & Profitable"
+                elif not is_market_confident:
                     should_sell = True
-                    reason = f"STOP LOSS: Forecast moved (Dist {distance:.1f}°) & Market Confidence Low ({current_bid}%)"
+                    reason = f"STOP LOSS: Forecast moved & Low Conf"
             
             if should_sell:
                 print(f"   ⚠️ RISK ALERT: Selling {pos['ticker']} ({reason})")
                 client.place_order(pos['ticker'], "sell", "yes", pos['position'], current_bid)
                 send_discord_alert(f"⚠️ **Risk Mgmt**: Dumped {pos['ticker']} @ {current_bid}¢. {reason}")
-
-    except Exception as e:
-        print(f"   Risk Check Error: {e}")
+    except: pass
 
 def main():
-    print("🚀 Bot Starting (Smart Exit V18)...")
+    print("🚀 Bot Starting (Date Locked V22)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
+    
+    current_utc = datetime.utcnow().hour
+    current_est = (current_utc - 5) % 24
+    
+    # 🔒 DATE LOCK
+    target_date_str = get_target_date_str()
+    print(f"🕒 Time: {current_est}:00 EST | 🔒 Targeting Markets for: {target_date_str}")
     
     try:
         client = KalshiClient()
         if client.get_balance() < MIN_BALANCE_CENTS: return
-        check_profits(client)
-    except: return
+        
+        check_daytime_profits(client)
+        
+        if current_est >= CASHOUT_HOUR:
+            liquidate_winners(client)
+            print(f"💤 Night Mode Active. Sleeping.")
+            return
+
+    except Exception as e:
+        print(f"❌ Login Error: {e}")
+        return
 
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
@@ -241,7 +269,6 @@ def main():
             
         print(f"   🎯 Target: {safe_forecast:.1f}°")
         
-        # 1. SMART RISK MANAGEMENT
         manage_risk(client, city['ticker'], safe_forecast)
 
         try:
@@ -251,16 +278,19 @@ def main():
         if not markets: continue
 
         for market in markets:
+            # 🔒 DATE CHECK: Skip if ticker doesn't match today's date
+            if target_date_str not in market['ticker']:
+                # print(f"   Skipping Old/Future Market: {market['ticker']}")
+                continue
+
             try:
                 strike = float(market['ticker'].split('-T')[-1])
             except: continue
 
             distance = abs(safe_forecast - strike)
             target_side = "no" 
-            
             if distance <= 1.5: target_side = "yes"
             
-            # Filters
             if target_side == "no" and distance < 3.0: continue
 
             ob = client.get_orderbook(market['ticker'])
