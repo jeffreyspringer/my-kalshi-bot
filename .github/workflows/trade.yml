@@ -26,7 +26,6 @@ jobs:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }} # <--- ADDED THIS
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }} 
         run: python -u bot.py
 
