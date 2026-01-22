@@ -5,6 +5,7 @@ import csv
 import time
 import json
 import base64
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -12,8 +13,11 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21  # 9 PM EST
+CASHOUT_HOUR = 21   # 9 PM EST
+REPORT_HOUR = 1     # 1 AM EST
 STATS_FILE = "city_stats.json"
+PORTFOLIO_FILE = "portfolio_history.csv"
+REPORT_TRACKER = "last_report_date.txt"
 
 # ✅ CITIES
 CITIES = [
@@ -100,10 +104,9 @@ class KalshiClient:
         
         return self._req("POST", "/portfolio/orders", body)
 
-# --- UTILS & STATS ---
+# --- LEDGER & REPORTING SYSTEM ---
 
 def get_city_meta(ticker):
-    """Finds city metadata from a ticker."""
     for city in CITIES:
         clean_ticker = city['ticker'].replace("KXHIGHT", "").replace("KXHIGH", "")
         if clean_ticker in ticker:
@@ -111,7 +114,6 @@ def get_city_meta(ticker):
     return {"name": "UNKNOWN", "emoji": "❓"}
 
 def update_city_stats(city_name, pnl_cents):
-    """Updates the persistent JSON file with PnL and returns new total."""
     stats = {}
     if os.path.exists(STATS_FILE):
         try:
@@ -125,49 +127,153 @@ def update_city_stats(city_name, pnl_cents):
     
     with open(STATS_FILE, 'w') as f:
         json.dump(stats, f)
-        
     return new_total
 
 def log_trade_csv(city_name, ticker, forecast, strike, gap, price, qty, action, pnl_cents, bankroll_cents):
-    """Writes a clean, Excel-friendly row."""
     file_exists = os.path.isfile("trade_log.csv")
     with open("trade_log.csv", "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            # ✅ NEW: Rich Headers
             writer.writerow(["Date", "City", "Action", "Ticker", "Qty", "Price ($)", "PnL ($)", "City Bankroll ($)", "Forecast", "Gap"])
         
-        # Format currency for Excel
         price_str = f"${price/100:.2f}"
         pnl_str = f"${pnl_cents/100:.2f}" if pnl_cents != 0 else "-"
         bankroll_str = f"${bankroll_cents/100:.2f}"
         forecast_str = f"{forecast}°" if forecast != "N/A" else "-"
         gap_str = f"{gap:.1f}°" if isinstance(gap, float) else "-"
         
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M"), 
-            city_name, 
-            action, 
-            ticker, 
-            qty, 
-            price_str, 
-            pnl_str, 
-            bankroll_str, 
-            forecast_str, 
-            gap_str
-        ])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), city_name, action, ticker, qty, price_str, pnl_str, bankroll_str, forecast_str, gap_str])
+
+def track_portfolio_value(client):
+    """Logs total account value (Cash + Equity) to history file."""
+    try:
+        balance = client.get_balance()
+        positions = client.get_positions()
+        
+        # Calculate Equity (Very rough estimate using Last Price or Cost Basis)
+        # Kalshi API doesn't give 'current value' easily, so we use cost basis for now
+        # or simplified assumption: Cash + (Positions * 50c estimate? No, use cost).
+        # Let's use Balance (Cash) as the main metric for "Realized" value.
+        # If you want Unrealized, we'd need to fetch current bid for every position.
+        # For speed, let's log CASH BALANCE (Realized PnL).
+        
+        # NOTE: A better metric for 'Account Value' requires summing (Qty * Current_Bid)
+        equity_cents = 0
+        for pos in positions:
+            # We skip 'checking price' loop to save API calls, just use Balance for now
+            # If you want true equity, we can add it, but it slows down the bot.
+            pass
+            
+        total_value_cents = balance # + equity_cents
+        
+        file_exists = os.path.isfile(PORTFOLIO_FILE)
+        with open(PORTFOLIO_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["Date", "Total Value ($)"])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), total_value_cents/100])
+            
+        return total_value_cents
+    except: return 0
+
+# --- CEO REPORT GENERATION ---
+
+def generate_trend_graph():
+    """Reads portfolio history and creates a trendline image."""
+    dates = []
+    values = []
+    
+    if not os.path.exists(PORTFOLIO_FILE): return None
+    
+    try:
+        with open(PORTFOLIO_FILE, 'r') as f:
+            reader = csv.reader(f)
+            next(reader, None) # Skip header
+            for row in reader:
+                dates.append(row[0]) # String date
+                values.append(float(row[1]))
+        
+        if not values: return None
+
+        # Create Plot
+        plt.figure(figsize=(10, 5))
+        plt.plot(values, marker='o', linestyle='-', color='#00d2be', linewidth=2)
+        plt.title('Portfolio Value Trend', color='white')
+        plt.xlabel('Time', color='white')
+        plt.ylabel('Value ($)', color='white')
+        
+        # Dark Mode Styling
+        plt.gca().set_facecolor('#2f3136')
+        plt.gcf().patch.set_facecolor('#2f3136')
+        plt.tick_params(axis='x', colors='white')
+        plt.tick_params(axis='y', colors='white')
+        plt.grid(color='#40444b', linestyle='--')
+        
+        # Save
+        filename = "chart.png"
+        plt.savefig(filename, bbox_inches='tight')
+        plt.close()
+        return filename
+    except Exception as e:
+        print(f"Graph Error: {e}")
+        return None
+
+def send_daily_report(client, current_balance):
+    """Compiles the Daily PnL, City Stats, and Graph into one message."""
+    print("--- 📊 Generating CEO Report ---")
+    
+    # 1. Load City Stats
+    city_stats = {}
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, 'r') as f:
+            city_stats = json.load(f)
+            
+    # 2. Format City Text
+    stats_text = ""
+    for city in CITIES:
+        pnl = city_stats.get(city['name'], 0)
+        emoji = city['emoji']
+        pnl_fmt = f"+${pnl/100:.2f}" if pnl >= 0 else f"-${abs(pnl)/100:.2f}"
+        stats_text += f"{emoji} **{city['name']}:** {pnl_fmt}\n"
+        
+    if not stats_text: stats_text = "No trades recorded yet."
+
+    # 3. Generate Graph
+    chart_file = generate_trend_graph()
+    
+    # 4. Send to Discord (Multipart Request)
+    webhook = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook: return
+
+    # Embed Data
+    embed = {
+        "title": "📊 Daily CEO Report",
+        "description": f"**Account Value:** ${current_balance/100:.2f}\n\n**🌍 City Performance (All-Time):**\n{stats_text}",
+        "color": 3447003, # Blue
+        "image": {"url": "attachment://chart.png"},
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+    # Multipart Form Data
+    files = {}
+    if chart_file:
+        files["file"] = (chart_file, open(chart_file, "rb"))
+        
+    payload = {"embeds": [embed]}
+    
+    # We have to send payload as JSON string in 'payload_json' field when using files
+    requests.post(webhook, data={"payload_json": json.dumps(payload)}, files=files)
+    print("✅ CEO Report Sent.")
+
+# --- DISCORD ALERTS (STANDARD) ---
 
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    
     payload = {
         "embeds": [{
-            "title": title,
-            "color": color,
-            "fields": fields,
-            "footer": { "text": "Kalshi Accountant V24" },
-            "timestamp": datetime.utcnow().isoformat()
+            "title": title, "color": color, "fields": fields,
+            "footer": { "text": "Kalshi Bot V25" }, "timestamp": datetime.utcnow().isoformat()
         }]
     }
     requests.post(webhook, json=payload)
@@ -193,13 +299,11 @@ def get_lamp_forecast(airport_code):
         url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt"
         res = requests.get(url)
         if res.status_code != 200: return None
-        
         utc_line, tmp_line = None, None
         for line in res.text.split('\n'):
             clean = line.strip()
             if clean.startswith("UTC"): utc_line = clean
             if clean.startswith("TMP"): tmp_line = clean
-            
         if not utc_line or not tmp_line: return None
         temps = [int(x) for x in tmp_line.split()[1:]]
         return max(temps[:15])
@@ -209,28 +313,11 @@ def get_lamp_forecast(airport_code):
 
 def execute_buy(client, market, qty, price, target_side, distance, safe_forecast):
     city_meta = get_city_meta(market['ticker'])
-    
     try:
         resp = client.place_order(market['ticker'], "buy", target_side, qty, price)
         if resp.status_code == 201:
-            # 1. Update JSON Stats (Buy doesn't change PnL, just reads bankroll)
             current_bankroll = update_city_stats(city_meta['name'], 0)
-            
-            # 2. Log to Excel
-            log_trade_csv(
-                city_meta['name'], 
-                market['ticker'], 
-                safe_forecast, 
-                0, # Strike hard to parse here, unused in new log
-                distance, 
-                price, 
-                qty, 
-                f"BUY {target_side.upper()}", 
-                0, 
-                current_bankroll
-            )
-            
-            # 3. Discord
+            log_trade_csv(city_meta['name'], market['ticker'], safe_forecast, 0, distance, price, qty, f"BUY {target_side.upper()}", 0, current_bankroll)
             fields = [
                 {"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True},
                 {"name": "Contract", "value": f"`{market['ticker']}`", "inline": True},
@@ -239,40 +326,19 @@ def execute_buy(client, market, qty, price, target_side, distance, safe_forecast
                 {"name": "City Bankroll", "value": f"${current_bankroll/100:.2f}", "inline": True}
             ]
             send_rich_discord_alert("🚀 BUY ORDER EXECUTED", 3447003, fields)
-    except Exception as e:
-        print(f"Buy Error: {e}")
+    except Exception as e: print(f"Buy Error: {e}")
 
 def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
     city_meta = get_city_meta(ticker)
-    
-    # Calculate PnL
     gross_pnl_cents = (sell_price - entry_price) * qty
-    
     try:
         resp = client.place_order(ticker, "sell", "yes", qty, sell_price)
         if resp.status_code == 201:
-            # 1. Update JSON Stats
             new_total = update_city_stats(city_meta['name'], gross_pnl_cents)
-            
-            # 2. Log to Excel
-            log_trade_csv(
-                city_meta['name'], 
-                ticker, 
-                "N/A", 
-                0, 
-                0, 
-                sell_price, 
-                qty, 
-                "SELL", 
-                gross_pnl_cents, 
-                new_total
-            )
-            
-            # 3. Discord
+            log_trade_csv(city_meta['name'], ticker, "N/A", 0, 0, sell_price, qty, "SELL", gross_pnl_cents, new_total)
             color = 5763719 if gross_pnl_cents >= 0 else 15548997
             emoji = "🤑" if gross_pnl_cents >= 0 else "⚠️"
             pnl_str = f"+${gross_pnl_cents/100:.2f}" if gross_pnl_cents >= 0 else f"-${abs(gross_pnl_cents)/100:.2f}"
-            
             fields = [
                 {"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True},
                 {"name": "Reason", "value": reason, "inline": True},
@@ -282,10 +348,9 @@ def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
             ]
             send_rich_discord_alert(f"{emoji} POSITION CLOSED", color, fields)
             print(f"   SOLD {ticker}: {pnl_str}")
-    except Exception as e:
-        print(f"Sell Error: {e}")
+    except Exception as e: print(f"Sell Error: {e}")
 
-# --- SCANNERS ---
+# --- SCANNERS & REPORTING ---
 
 def check_daytime_profits(client):
     print("--- 💰 Checking for Jackpots (>92¢) ---")
@@ -296,7 +361,6 @@ def check_daytime_profits(client):
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
             best_bid = ob['yes'][0][0]
-            
             if best_bid >= PROFIT_TAKE_PRICE:
                 entry_price = pos.get('average_price', pos.get('avg_price', 0))
                 execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "JACKPOT (>92¢)")
@@ -312,7 +376,6 @@ def liquidate_winners(client):
             if not ob or not ob['yes']: continue
             best_bid = ob['yes'][0][0]
             entry_price = pos.get('average_price', pos.get('avg_price', 0))
-            
             if best_bid > entry_price and best_bid > 5:
                 execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "NIGHT CASHOUT")
     except: pass
@@ -323,51 +386,54 @@ def manage_risk(client, city_ticker, current_forecast):
         for pos in positions:
             if city_ticker not in pos['ticker']: continue
             if pos['position'] <= 0: continue
-            
-            try:
-                strike = float(pos['ticker'].split('-T')[-1])
+            try: strike = float(pos['ticker'].split('-T')[-1])
             except: continue
-            
             distance = abs(current_forecast - strike)
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
             current_bid = ob['yes'][0][0]
             entry_price = pos.get('average_price', pos.get('avg_price', 0))
-            
             should_sell = False
             reason = ""
-            
             if distance > 2.0:
                 is_profitable = current_bid > entry_price
                 is_market_confident = current_bid > 50
-                
                 if is_profitable:
                     should_sell = True
                     reason = "PROFIT PROTECT (Forecast Shift)"
                 elif not is_market_confident:
                     should_sell = True
                     reason = "STOP LOSS (Forecast Shift)"
-            
             if should_sell:
                 execute_sell(client, pos['ticker'], pos['position'], current_bid, entry_price, reason)
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Accountant V24)...")
+    print("🚀 Bot Starting (CEO Report V25)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
     current_est = (current_utc - 5) % 24
-    
+    today_str = datetime.now().strftime("%Y-%m-%d")
     target_date_str = get_target_date_str()
     print(f"🕒 Time: {current_est}:00 EST | 🔒 Date: {target_date_str}")
     
     try:
         client = KalshiClient()
-        if client.get_balance() < MIN_BALANCE_CENTS: return
+        current_balance = track_portfolio_value(client) # Logs balance to CSV
+        if current_balance < MIN_BALANCE_CENTS: return
         
+        # --- CEO REPORT CHECK (1 AM EST) ---
+        if current_est == REPORT_HOUR:
+            last_report = ""
+            if os.path.exists(REPORT_TRACKER):
+                with open(REPORT_TRACKER, "r") as f: last_report = f.read().strip()
+            
+            if last_report != today_str:
+                send_daily_report(client, current_balance)
+                with open(REPORT_TRACKER, "w") as f: f.write(today_str)
+
         check_daytime_profits(client)
-        
         if current_est >= CASHOUT_HOUR:
             liquidate_winners(client)
             print(f"💤 Night Mode Active. Sleeping.")
@@ -382,38 +448,28 @@ def main():
         print(f"\n🔎 {city['name']}...")
         nws = get_nws_forecast(city['lat'], city['lon'])
         lamp = get_lamp_forecast(city['airport'])
-        
         if nws and lamp: safe_forecast = (nws + lamp) / 2
         elif nws: safe_forecast = nws
         elif lamp: safe_forecast = lamp
         else: continue
-            
         print(f"   🎯 Target: {safe_forecast:.1f}°")
         
         manage_risk(client, city['ticker'], safe_forecast)
-
-        try:
-            markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
+        try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: continue
-        
         if not markets: continue
 
         for market in markets:
             if target_date_str not in market['ticker']: continue
-
-            try:
-                strike = float(market['ticker'].split('-T')[-1])
+            try: strike = float(market['ticker'].split('-T')[-1])
             except: continue
-
             distance = abs(safe_forecast - strike)
             target_side = "no" 
             if distance <= 1.5: target_side = "yes"
-            
             if target_side == "no" and distance < 3.0: continue
 
             ob = client.get_orderbook(market['ticker'])
             if not ob: continue
-
             price = 0
             if target_side == "yes":
                 if not ob['no']: continue
@@ -421,19 +477,15 @@ def main():
             else: 
                 if not ob['yes']: continue
                 price = 100 - ob['yes'][0][0]
-
             if price < MIN_PRICE or price > MAX_PRICE: continue
-
             qty = LOW_CONF_COUNT
             if target_side == "yes": qty = MED_CONF_COUNT
             if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT
-
             try:
                 positions = client.get_positions()
                 curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
                 qty = min(qty, MAX_TOTAL_POS - abs(curr_pos))
             except: qty = LOW_CONF_COUNT
-            
             if qty <= 0: continue
 
             print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side.upper()}] @ {price}¢")
