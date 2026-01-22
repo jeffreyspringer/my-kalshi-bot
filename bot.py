@@ -142,7 +142,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V32 (Auditor)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V33 (Transparency)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -166,12 +166,11 @@ def get_lamp_forecast(airport_code):
         if res.status_code != 200: return None
         tmp_line = None
         for line in res.text.split('\n'):
-            # Flexible parsing for lines starting with TMP or ' TMP'
+            # More robust parsing for LAMP lines
             if "TMP" in line and len(line) > 20: 
                 tmp_line = line
                 break
         if not tmp_line: return None
-        # Extract all numbers from the line
         temps = [int(s) for s in tmp_line.split() if s.isdigit()]
         return max(temps[:15]) if temps else None
     except: return None
@@ -272,7 +271,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V32 Auditor)...")
+    print("🚀 Bot Starting (V33 Transparency)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -296,7 +295,6 @@ def main():
         nws = get_nws_forecast(city['lat'], city['lon'])
         lamp = get_lamp_forecast(city['airport'])
         
-        # Forecast display
         nws_str = f"{nws}°" if nws else "N/A"
         lamp_str = f"{lamp}°" if lamp else "N/A"
         if not nws and not lamp: 
@@ -315,13 +313,11 @@ def main():
         if not markets: continue
 
         for market in markets:
-            # 🔍 AUDITOR LOGIC: Print everything, then decide
             ticker = market['ticker']
             
-            # Extract Date from ticker
+            # 🔍 TRANSPARENCY: Tell us if the date is wrong
             if target_date_str not in ticker:
-                # print(f"   Skipping {ticker}: Wrong Date") 
-                # Uncomment line above if you want to see the future markets!
+                print(f"   [SKIP] {ticker} (Wrong Date)")
                 continue
             
             try: strike = float(ticker.split('-T')[-1])
@@ -329,7 +325,7 @@ def main():
             
             distance = abs(safe_forecast - strike)
             
-            # --- DECISION LOGIC ---
+            # LOGIC: Pick the winning side
             target_side = "no"
             if distance <= 1.5: target_side = "yes"
             
