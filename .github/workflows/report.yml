@@ -25,9 +25,6 @@ jobs:
 
       - name: Run CEO Report
         env:
-          KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
-          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # We only need the Discord hook here, no Kalshi keys needed
           DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }}
-          TRADING_ENABLED: "TRUE"
-        run: python bot.py
+        run: python report.py  # <--- CHANGED FROM bot.py
