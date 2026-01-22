@@ -142,7 +142,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V31 (Detective)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V32 (Auditor)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -166,10 +166,14 @@ def get_lamp_forecast(airport_code):
         if res.status_code != 200: return None
         tmp_line = None
         for line in res.text.split('\n'):
-            if line.strip().startswith("TMP"): tmp_line = line.strip()
+            # Flexible parsing for lines starting with TMP or ' TMP'
+            if "TMP" in line and len(line) > 20: 
+                tmp_line = line
+                break
         if not tmp_line: return None
-        temps = [int(x) for x in tmp_line.split()[1:]]
-        return max(temps[:15])
+        # Extract all numbers from the line
+        temps = [int(s) for s in tmp_line.split() if s.isdigit()]
+        return max(temps[:15]) if temps else None
     except: return None
 
 # --- TRADING ACTIONS ---
@@ -268,7 +272,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V31 Detective)...")
+    print("🚀 Bot Starting (V32 Auditor)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -291,11 +295,13 @@ def main():
         print(f"\n🔎 {city['name']}...")
         nws = get_nws_forecast(city['lat'], city['lon'])
         lamp = get_lamp_forecast(city['airport'])
-        if not nws and not lamp: print("   ⚠️ No Weather Data"); continue
         
-        # 🔍 NEW: Print individual forecasts before averaging
+        # Forecast display
         nws_str = f"{nws}°" if nws else "N/A"
         lamp_str = f"{lamp}°" if lamp else "N/A"
+        if not nws and not lamp: 
+            print("   ⚠️ No Weather Data"); continue
+        
         safe_forecast = (nws + lamp) / 2 if (nws and lamp) else (nws or lamp)
         print(f"   🎯 Forecast: {safe_forecast:.1f}° (NWS: {nws_str} | LAMP: {lamp_str})")
         
@@ -304,35 +310,34 @@ def main():
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: print("   ⚠️ API Error fetching markets"); continue
         
-        # 🔍 NEW: Debug Raw Market Count
         print(f"   [DEBUG] API returned {len(markets)} markets total.")
         
         if not markets: continue
 
-        count_for_today = 0
         for market in markets:
-            if target_date_str not in market['ticker']: continue
-            count_for_today += 1
+            # 🔍 AUDITOR LOGIC: Print everything, then decide
+            ticker = market['ticker']
             
-            try: strike = float(market['ticker'].split('-T')[-1])
+            # Extract Date from ticker
+            if target_date_str not in ticker:
+                # print(f"   Skipping {ticker}: Wrong Date") 
+                # Uncomment line above if you want to see the future markets!
+                continue
+            
+            try: strike = float(ticker.split('-T')[-1])
             except: continue
             
             distance = abs(safe_forecast - strike)
             
-            # Smart Betting Logic
+            # --- DECISION LOGIC ---
             target_side = "no"
             if distance <= 1.5: target_side = "yes"
-            
-            # Why we don't check "Both Sides":
-            # If distance is > 3.0, "Yes" is a Hail Mary pass (long shot).
-            # We only bet on Probability > 60%. 
-            # If we switch to 'yes', we are betting on < 5% probability.
             
             if target_side == "no" and distance < 3.0:
                 print(f"   Skipping {strike}°: Too risky for NO (Dist {distance:.1f})")
                 continue
 
-            ob = client.get_orderbook(market['ticker'])
+            ob = client.get_orderbook(ticker)
             if not ob: 
                 print(f"   Skipping {strike}°: Orderbook Empty")
                 continue
@@ -350,18 +355,15 @@ def main():
                 price = 100 - ob['yes'][0][0]
 
             if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   Skipping {strike}°: Price {price}¢ is outside safe zone ({MIN_PRICE}-{MAX_PRICE}¢)")
+                print(f"   Skipping {strike}°: Price {price}¢ is outside safe zone")
                 continue
 
             qty = LOW_CONF_COUNT
             if target_side == "yes": qty = MED_CONF_COUNT
             if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT
             
-            print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side}] @ {price}¢")
+            print(f"   🚀 EXECUTE: Buying {qty}x {ticker} [{target_side}] @ {price}¢")
             execute_buy(client, market, qty, price, target_side, distance, safe_forecast)
-        
-        if count_for_today == 0:
-            print(f"   ⚠️ API returned {len(markets)} markets, but NONE matched date '{target_date_str}'")
 
 if __name__ == "__main__":
     main()
