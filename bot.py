@@ -35,7 +35,6 @@ MAX_PRICE = 98
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
-# 👇 LOWERED SAFETY BUFFER (Was 1.5, now 1.2 to allow more trades)
 SAFETY_BUFFER = 1.2 
 
 class KalshiClient:
@@ -145,7 +144,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V37 (Action Mode)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V38 (API Fix)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -163,30 +162,30 @@ def get_nws_forecast(lat, lon):
     except: pass
     return None
 
-def get_lamp_forecast(airport_code):
+def get_nws_hourly_forecast(lat, lon):
+    """Fetches the max temp from the next 18 hours of hourly forecast"""
     try:
-        # ✅ FIX 1: Send User-Agent to pass NWS security check
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
-        # ✅ FIX 2: Use UPPERCASE filename (Unix servers are case-sensitive)
-        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.upper()}.txt"
+        # 1. Get the gridpoints (if we don't have them cached)
+        p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
+        f_url = p_res['properties']['forecastHourly']
         
-        res = requests.get(url, headers=headers, timeout=10)
+        # 2. Get the hourly data
+        grid = requests.get(f_url, headers=headers).json()
+        periods = grid['properties']['periods']
         
-        if res.status_code != 200: 
-            print(f"   [LAMP ERROR] {airport_code} Status: {res.status_code}")
-            return None
+        # 3. Look ahead 18 hours (enough to cover the rest of the day)
+        temps = []
+        for i in range(min(18, len(periods))):
+            temps.append(periods[i]['temperature'])
             
-        tmp_line = None
-        for line in res.text.split('\n'):
-            if "TMP" in line and len(line) > 20: 
-                tmp_line = line
-                break
-        if not tmp_line: return None
-        temps = [int(s) for s in tmp_line.split() if s.isdigit()]
-        return max(temps[:15]) if temps else None
+        if temps:
+            return max(temps)
+            
     except Exception as e:
-        print(f"   [LAMP ERROR] {e}")
+        print(f"   [NWS HOURLY ERROR] {e}")
         return None
+    return None
 
 # --- TRADING ACTIONS ---
 def execute_buy(client, market, qty, price, target_side, distance, safe_forecast):
@@ -285,7 +284,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V37 Action Mode)...")
+    print("🚀 Bot Starting (V38 API Fix)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -307,15 +306,20 @@ def main():
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
         nws = get_nws_forecast(city['lat'], city['lon'])
-        lamp = get_lamp_forecast(city['airport'])
+        # 👇 NEW: Uses reliable API instead of broken text server
+        hourly_max = get_nws_hourly_forecast(city['lat'], city['lon'])
         
         nws_str = f"{nws}°" if nws else "N/A"
-        lamp_str = f"{lamp}°" if lamp else "N/A"
-        if not nws and not lamp: 
+        hourly_str = f"{hourly_max}°" if hourly_max else "N/A"
+        
+        if not nws and not hourly_max: 
             print("   ⚠️ No Weather Data"); continue
         
-        safe_forecast = (nws + lamp) / 2 if (nws and lamp) else (nws or lamp)
-        print(f"   🎯 Forecast: {safe_forecast:.1f}° (NWS: {nws_str} | LAMP: {lamp_str})")
+        # Smart average: if one is missing, use the other
+        if nws and hourly_max: safe_forecast = (nws + hourly_max) / 2
+        else: safe_forecast = nws or hourly_max
+        
+        print(f"   🎯 Forecast: {safe_forecast:.1f}° (Daily: {nws_str} | Hourly Max: {hourly_str})")
         
         manage_risk(client, city['ticker'], safe_forecast)
         
@@ -339,7 +343,6 @@ def main():
             delta = safe_forecast - strike
             
             target_side = "none"
-            # 👇 Relaxed checks using SAFETY_BUFFER (1.2 instead of 1.5)
             if delta > SAFETY_BUFFER: target_side = "yes"
             elif delta < -SAFETY_BUFFER: target_side = "no"
             else:
