@@ -17,12 +17,13 @@ CASHOUT_HOUR = 21
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
 
+# ✅ CITIES with Timezone Offsets (for midnight filtering)
 CITIES = [
-    { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY", "emoji": "🎷" },
-    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW", "emoji": "🍕" },
-    { "name": "MIAMI",   "lat": 25.80, "lon": -80.29,  "ticker": "KXHIGHMIA",   "airport": "KMIA", "emoji": "🌴" },
-    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA",  "airport": "KSEA", "emoji": "☕" },
-    { "name": "AUSTIN",  "lat": 30.19, "lon": -97.67,  "ticker": "KXHIGHAUS",   "airport": "KAUS", "emoji": "🎸" }
+    { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY", "emoji": "🎷", "tz_offset": -6 },
+    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW", "emoji": "🍕", "tz_offset": -6 },
+    { "name": "MIAMI",   "lat": 25.80, "lon": -80.29,  "ticker": "KXHIGHMIA",   "airport": "KMIA", "emoji": "🌴", "tz_offset": -5 },
+    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA",  "airport": "KSEA", "emoji": "☕", "tz_offset": -8 },
+    { "name": "AUSTIN",  "lat": 30.19, "lon": -97.67,  "ticker": "KXHIGHAUS",   "airport": "KAUS", "emoji": "🎸", "tz_offset": -6 }
 ]
 
 MIN_BALANCE_CENTS = 500     
@@ -115,7 +116,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V42 (Historian)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V43 (Local Sync)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -123,19 +124,25 @@ def get_target_date_str():
 
 # --- FORECASTING & HISTORY ---
 
-def get_today_high_so_far(airport_code):
-    """Checks actual recorded observations since midnight to catch Midnight Highs"""
+def get_today_high_so_far(airport_code, tz_offset):
+    """Checks observations since local midnight using station-specific offset"""
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         url = f"https://api.weather.gov/stations/{airport_code.upper()}/observations"
         res = requests.get(url, headers=headers).json()
         
-        today_date = datetime.now(timezone.utc).date()
+        # Local "Today" calculation
+        local_now = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+        today_local = local_now.date()
         obs_temps = []
         
         for obs in res['features']:
-            timestamp = datetime.fromisoformat(obs['properties']['timestamp'].replace('Z', '+00:00'))
-            if timestamp.date() == today_date:
+            # Convert UTC timestamp from API to City's Local Time
+            utc_time = datetime.fromisoformat(obs['properties']['timestamp'].replace('Z', '+00:00'))
+            local_time = utc_time + timedelta(hours=tz_offset)
+            
+            # Only count if it happened on Today's local calendar date
+            if local_time.date() == today_local:
                 temp_c = obs['properties']['temperature']['value']
                 if temp_c is not None:
                     temp_f = (temp_c * 9/5) + 32
@@ -207,7 +214,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V42 Historian)...")
+    print("🚀 Bot Starting (V43 Local Sync)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -229,22 +236,20 @@ def main():
 
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
-        # 1. Get Forward Forecasts
         nws = get_nws_forecast(city['lat'], city['lon'])
         hourly = get_nws_hourly_forecast(city['lat'], city['lon'])
+        high_so_far = get_today_high_so_far(city['airport'], city['tz_offset'])
         
-        # 2. Get Historical High Today (CRITICAL)
-        high_so_far = get_today_high_so_far(city['airport'])
+        nws_str = f"{nws}°" if nws else "N/A"
+        hourly_str = f"{hourly}°" if hourly else "N/A"
         
         if not nws and not hourly: continue
         
-        # Calculate expected high for the remainder of the day
         future_high = (nws + hourly) / 2 if (nws and hourly) else (nws or hourly)
-        
-        # ✅ REAL HIGH = The greater of (What we expect) vs (What already happened)
         safe_forecast = max(future_high, high_so_far)
         
-        print(f"   🎯 Logic: Future Forecast {future_high:.1f}° | Already Hit {high_so_far:.1f}°")
+        # ✅ RESTORED LABELS: Shows Daily, Hourly, and Historical breakdown
+        print(f"   🎯 Logic: Daily {nws_str} | Hourly {hourly_str} | Hist {high_so_far:.1f}°")
         print(f"   ✅ Final Target High: {safe_forecast:.1f}°")
         
         manage_risk(client, city['ticker'], safe_forecast)
@@ -284,7 +289,7 @@ def main():
             if diff < 0.3: qty = MED_CONF_COUNT 
             if diff > 3.0: qty = HIGH_CONF_COUNT 
             
-            print(f"   🚀 Buying {qty}x {ticker} [{target_side}] @ {price}¢")
+            print(f"   🚀 Buying {qty}x {ticker} [{target_side.upper()}] @ {price}¢")
             execute_buy(client, market, qty, price, target_side, diff, safe_forecast)
 
 if __name__ == "__main__": main()
