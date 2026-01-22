@@ -12,12 +12,14 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
+# --- CONFIGURATION: CITY LIST ---
+# Updated Tickers based on Live 2026 Kalshi Data
 CITIES = [
-    { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },
-    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHTCHI" },
-    { "name": "MIAMI", "lat": 25.80, "lon": -80.29, "ticker": "KXHIGHTMIA" },
-    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA" },
-    { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHTAUS" }
+    { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },   # Working
+    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHCHI" },  # Fixed (Removed T)
+    { "name": "MIAMI", "lat": 25.80, "lon": -80.29, "ticker": "KXHIGHMIA" },    # Fixed (Removed T)
+    { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA" },# Working
+    { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHAUS" }    # Fixed (Removed T)
 ]
 
 # RISK SETTINGS
