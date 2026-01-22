@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
 
-# ✅ CITIES (Tickers + Airport Codes)
+# ✅ CITIES
 CITIES = [
     { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY" },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW" },
@@ -27,8 +27,8 @@ MIN_BALANCE_CENTS = 500
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
 FEE_BUFFER = 3
-MIN_PRICE = 20
-MAX_PRICE = 80
+MIN_PRICE = 2              # We want to buy cheap "No" bets too
+MAX_PRICE = 98
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
@@ -111,8 +111,7 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
             writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
-# --- FORECASTING ENGINES ---
-
+# --- FORECASTING ---
 def get_nws_forecast(lat, lon):
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
@@ -120,44 +119,29 @@ def get_nws_forecast(lat, lon):
         f_url = p_res['properties']['forecast']
         grid = requests.get(f_url, headers=headers).json()
         for p in grid['properties']['periods']:
-            if p['isDaytime']:
-                return p['temperature']
-    except Exception as e:
-        print(f"   ⚠️ NWS Error: {e}")
+            if p['isDaytime']: return p['temperature']
+    except: pass
     return None
 
 def get_lamp_forecast(airport_code):
-    """Fetches GFS LAMP data. FIXED: Uses lowercase for URL."""
     try:
-        # ⚠️ CRITICAL FIX: .lower() ensures we hit 'kmsy.txt' instead of 'KMSY.txt'
         url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt"
         res = requests.get(url)
+        if res.status_code != 200: return None
         
-        if res.status_code != 200: 
-            print(f"   ⚠️ LAMP Failed: {airport_code} not found (404).")
-            return None
-        
-        lines = res.text.split('\n')
         utc_line, tmp_line = None, None
-        
-        for line in lines:
+        for line in res.text.split('\n'):
             clean = line.strip()
             if clean.startswith("UTC"): utc_line = clean
             if clean.startswith("TMP"): tmp_line = clean
             
-        if not utc_line or not tmp_line: 
-            return None
-        
+        if not utc_line or not tmp_line: return None
         temps = [int(x) for x in tmp_line.split()[1:]]
-        valid_temps = temps[:15]
-        return max(valid_temps)
-        
-    except Exception as e:
-        print(f"   ⚠️ LAMP Error: {e}")
-        return None
+        return max(temps[:15])
+    except: return None
 
 def check_profits(client):
-    print("--- 💰 Checking for Profit Opportunities ---")
+    print("--- 💰 Checking Profit Taking ---")
     try:
         positions = client.get_positions()
         for pos in positions:
@@ -167,107 +151,109 @@ def check_profits(client):
             best_bid = ob['yes'][0][0]
             
             if best_bid >= PROFIT_TAKE_PRICE:
-                print(f"   🤑 PROFIT! Selling {pos['position']}x {pos['ticker']} @ {best_bid}¢")
+                print(f"   🤑 PROFIT! Selling {pos['ticker']} @ {best_bid}¢")
                 try:
-                    resp = client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
-                    if resp.status_code == 201:
-                        log_trade(pos['ticker'], "PROFIT", "N/A", 0, best_bid, pos['position'], "SELL")
-                        send_discord_alert(f"💰 **Profit Taken!** Sold {pos['position']}x {pos['ticker']} @ **{best_bid}¢**")
+                    client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
+                    send_discord_alert(f"💰 **Profit!** Sold {pos['ticker']} @ {best_bid}¢")
                 except: pass
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Dual-Engine V14)...")
+    print("🚀 Bot Starting (Sniper Mode V16)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
         client = KalshiClient()
-        balance = client.get_balance()
-        print(f"✅ Balance: {balance}¢")
-        if balance < MIN_BALANCE_CENTS: return
+        if client.get_balance() < MIN_BALANCE_CENTS: return
         check_profits(client)
-    except Exception as e:
-        print(f"❌ Login Failed: {e}")
-        return
+    except: return
 
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
-        print(f"\n🔎 {city['name']} ({city['airport']})...")
-        
+        print(f"\n🔎 {city['name']}...")
         nws = get_nws_forecast(city['lat'], city['lon'])
         lamp = get_lamp_forecast(city['airport'])
         
-        print(f"   Forecasts: NWS {nws}° | LAMP {lamp}°")
-        
-        if nws and lamp:
-            safe_forecast = (nws + lamp) / 2
-        elif nws:
-            safe_forecast = nws
-        elif lamp:
-            safe_forecast = lamp
-        else:
-            print("   ⚠️ No data available. Skipping.")
-            continue
+        if nws and lamp: safe_forecast = (nws + lamp) / 2
+        elif nws: safe_forecast = nws
+        elif lamp: safe_forecast = lamp
+        else: continue
             
         print(f"   🎯 Target: {safe_forecast:.1f}°")
 
         try:
-            res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
-            markets = res.json().get("markets", [])
-        except: 
-            print("   ⚠️ Failed to fetch markets.")
-            continue
-
+            markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
+        except: continue
+        
         if not markets: 
-            print("   ⚠️ No active markets.")
+            print("   No markets.")
             continue
 
         for market in markets:
             try:
+                # Assuming ticker ends with -T70 (Strike)
                 strike = float(market['ticker'].split('-T')[-1])
             except: continue
 
-            gap = safe_forecast - strike
+            # --- SNIPER LOGIC (BIN STRATEGY) ---
+            # Distance: How far is this bin from our Forecast?
+            distance = abs(safe_forecast - strike)
             
-            # VERBOSE LOGGING
-            if gap < 2.0: 
-                print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small.")
-                continue 
+            # DEFAULT: Assume this bin is WRONG (Buy No)
+            target_side = "no" 
+            label = "FAR_OFF"
+
+            # IF distance is very small (It's the Bullseye), we Buy YES
+            if distance <= 1.5:
+                target_side = "yes"
+                label = "BULLSEYE"
             
-            qty = LOW_CONF_COUNT
-            if gap >= 5.0: qty = HIGH_CONF_COUNT
-            elif gap >= 3.0: qty = MED_CONF_COUNT
-            
-            positions = client.get_positions()
-            curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
-            qty = min(qty, MAX_TOTAL_POS - curr_pos)
-            
-            if qty <= 0: 
-                print(f"   Skipping {market['ticker']}: Max position reached.")
+            # --- FILTERING ---
+            # If it's a "No" bet, we want a nice safe distance (e.g. > 3 degrees away)
+            # If it's too close (e.g. 2 degrees), it's risky. Skip.
+            if target_side == "no" and distance < 3.0:
+                print(f"   Skipping {market['ticker']}: Too close to call (Dist {distance:.1f}°).")
                 continue
 
+            # --- PRICING ---
             ob = client.get_orderbook(market['ticker'])
-            if not ob or not ob['no']: continue
-            best_no_bid = ob['no'][0][0]
-            buy_yes_price = 100 - best_no_bid
-            
-            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: 
-                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ outside range.")
+            if not ob: continue
+
+            price = 0
+            if target_side == "yes":
+                if not ob['no']: continue
+                price = 100 - ob['no'][0][0] # Cost to buy Yes
+            else: 
+                if not ob['yes']: continue
+                price = 100 - ob['yes'][0][0] # Cost to buy No
+
+            # --- EXECUTION ---
+            if price < MIN_PRICE or price > MAX_PRICE:
+                print(f"   Skipping {market['ticker']} ({target_side.upper()}): Price {price}¢ bad.")
                 continue
+
+            # Sizing
+            qty = LOW_CONF_COUNT
+            if target_side == "yes": qty = MED_CONF_COUNT # Be modest on Bullseyes
+            if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT # Be aggressive on "Obvious Nos"
+
+            # Position Check
+            try:
+                positions = client.get_positions()
+                curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
+                qty = min(qty, MAX_TOTAL_POS - abs(curr_pos))
+            except: qty = LOW_CONF_COUNT
             
-            if buy_yes_price < (75 - FEE_BUFFER):
-                print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} @ {buy_yes_price}¢")
-                try:
-                    resp = client.place_order(market['ticker'], "buy", "yes", qty, buy_yes_price)
-                    if resp.status_code == 201:
-                        log_trade(market['ticker'], safe_forecast, strike, gap, buy_yes_price, qty, "BUY")
-                        send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} @ {buy_yes_price}¢")
-                    else:
-                        print(f"   ❌ Order Failed: {resp.text}")
-                except Exception as e:
-                    print(f"   ❌ Order Error: {e}")
-            else:
-                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ too expensive.")
+            if qty <= 0: continue
+
+            print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side.upper()}] @ {price}¢ (Dist {distance:.1f})")
+            
+            try:
+                resp = client.place_order(market['ticker'], "buy", target_side, qty, price)
+                if resp.status_code == 201:
+                    log_trade(market['ticker'], safe_forecast, strike, distance, price, qty, f"BUY_{target_side.upper()}")
+                    send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} **{target_side.upper()}** @ {price}¢ (Dist {distance:.1f})")
+            except: pass
 
 if __name__ == "__main__":
     main()
