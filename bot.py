@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21   # 9 PM EST: Stop trading, sell winners
+CASHOUT_HOUR = 21   # 9 PM EST
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
 
@@ -29,7 +29,6 @@ CITIES = [
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
-FEE_BUFFER = 3
 MIN_PRICE = 2              
 MAX_PRICE = 98
 LOW_CONF_COUNT = 1
@@ -102,7 +101,6 @@ class KalshiClient:
         return self._req("POST", "/portfolio/orders", body)
 
 # --- LEDGER SYSTEM ---
-
 def get_city_meta(ticker):
     for city in CITIES:
         clean_ticker = city['ticker'].replace("KXHIGHT", "").replace("KXHIGH", "")
@@ -114,16 +112,11 @@ def update_city_stats(city_name, pnl_cents):
     stats = {}
     if os.path.exists(STATS_FILE):
         try:
-            with open(STATS_FILE, 'r') as f:
-                stats = json.load(f)
+            with open(STATS_FILE, 'r') as f: stats = json.load(f)
         except: pass
-    
-    current_total = stats.get(city_name, 0)
-    new_total = current_total + pnl_cents
+    new_total = stats.get(city_name, 0) + pnl_cents
     stats[city_name] = new_total
-    
-    with open(STATS_FILE, 'w') as f:
-        json.dump(stats, f)
+    with open(STATS_FILE, 'w') as f: json.dump(stats, f)
     return new_total
 
 def log_trade_csv(city_name, ticker, forecast, strike, gap, price, qty, action, pnl_cents, bankroll_cents):
@@ -132,42 +125,24 @@ def log_trade_csv(city_name, ticker, forecast, strike, gap, price, qty, action, 
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(["Date", "City", "Action", "Ticker", "Qty", "Price ($)", "PnL ($)", "City Bankroll ($)", "Forecast", "Gap"])
-        
-        price_str = f"${price/100:.2f}"
-        pnl_str = f"${pnl_cents/100:.2f}" if pnl_cents != 0 else "-"
-        bankroll_str = f"${bankroll_cents/100:.2f}"
-        forecast_str = f"{forecast}°" if forecast != "N/A" else "-"
-        gap_str = f"{gap:.1f}°" if isinstance(gap, float) else "-"
-        
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), city_name, action, ticker, qty, price_str, pnl_str, bankroll_str, forecast_str, gap_str])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), city_name, action, ticker, qty, f"${price/100:.2f}", f"${pnl_cents/100:.2f}" if pnl_cents!=0 else "-", f"${bankroll_cents/100:.2f}", f"{forecast}°", f"{gap:.1f}°"])
 
 def track_portfolio_value(client):
     try:
         balance = client.get_balance()
-        total_value_cents = balance 
-        
         file_exists = os.path.isfile(PORTFOLIO_FILE)
         with open(PORTFOLIO_FILE, "a", newline="") as f:
             writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Date", "Total Value ($)"])
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), total_value_cents/100])
-            
-        return total_value_cents
+            if not file_exists: writer.writerow(["Date", "Total Value ($)"])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), balance/100])
+        return balance
     except: return 0
 
-# --- DISCORD ALERTS ---
-
+# --- DISCORD ---
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    payload = {
-        "embeds": [{
-            "title": title, "color": color, "fields": fields,
-            "footer": { "text": "Kalshi Bot Trader" }, "timestamp": datetime.utcnow().isoformat()
-        }]
-    }
-    requests.post(webhook, json=payload)
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V30 (Debug)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -187,21 +162,17 @@ def get_nws_forecast(lat, lon):
 
 def get_lamp_forecast(airport_code):
     try:
-        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt"
-        res = requests.get(url)
+        res = requests.get(f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt")
         if res.status_code != 200: return None
-        utc_line, tmp_line = None, None
+        tmp_line = None
         for line in res.text.split('\n'):
-            clean = line.strip()
-            if clean.startswith("UTC"): utc_line = clean
-            if clean.startswith("TMP"): tmp_line = clean
-        if not utc_line or not tmp_line: return None
+            if line.strip().startswith("TMP"): tmp_line = line.strip()
+        if not tmp_line: return None
         temps = [int(x) for x in tmp_line.split()[1:]]
         return max(temps[:15])
     except: return None
 
 # --- TRADING ACTIONS ---
-
 def execute_buy(client, market, qty, price, target_side, distance, safe_forecast):
     city_meta = get_city_meta(market['ticker'])
     try:
@@ -217,6 +188,9 @@ def execute_buy(client, market, qty, price, target_side, distance, safe_forecast
                 {"name": "City Bankroll", "value": f"${current_bankroll/100:.2f}", "inline": True}
             ]
             send_rich_discord_alert("🚀 BUY ORDER EXECUTED", 3447003, fields)
+            print(f"   ✅ SUCCESS: Bought {qty}x {market['ticker']}")
+        else:
+            print(f"   ❌ FAILED: {resp.text}")
     except Exception as e: print(f"Buy Error: {e}")
 
 def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
@@ -228,23 +202,19 @@ def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
             new_total = update_city_stats(city_meta['name'], gross_pnl_cents)
             log_trade_csv(city_meta['name'], ticker, "N/A", 0, 0, sell_price, qty, "SELL", gross_pnl_cents, new_total)
             color = 5763719 if gross_pnl_cents >= 0 else 15548997
-            emoji = "🤑" if gross_pnl_cents >= 0 else "⚠️"
-            pnl_str = f"+${gross_pnl_cents/100:.2f}" if gross_pnl_cents >= 0 else f"-${abs(gross_pnl_cents)/100:.2f}"
             fields = [
                 {"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True},
                 {"name": "Reason", "value": reason, "inline": True},
                 {"name": "Result", "value": f"Sold {qty}x @ {sell_price}¢ (Entry: {entry_price}¢)", "inline": False},
-                {"name": "Trade PnL", "value": f"**{pnl_str}**", "inline": True},
-                {"name": "New City Bankroll", "value": f"${new_total/100:.2f}", "inline": True}
+                {"name": "PnL", "value": f"**${gross_pnl_cents/100:.2f}**", "inline": True},
+                {"name": "Bankroll", "value": f"${new_total/100:.2f}", "inline": True}
             ]
-            send_rich_discord_alert(f"{emoji} POSITION CLOSED", color, fields)
-            print(f"   SOLD {ticker}: {pnl_str}")
+            send_rich_discord_alert(f"🤑 POSITION CLOSED", color, fields)
+            print(f"   ✅ SOLD {ticker}")
     except Exception as e: print(f"Sell Error: {e}")
 
-# --- SCANNERS ---
-
 def check_daytime_profits(client):
-    print("--- 💰 Checking for Jackpots (>92¢) ---")
+    print("--- 💰 Checking for Jackpots ---")
     try:
         positions = client.get_positions()
         for pos in positions:
@@ -253,12 +223,12 @@ def check_daytime_profits(client):
             if not ob or not ob['yes']: continue
             best_bid = ob['yes'][0][0]
             if best_bid >= PROFIT_TAKE_PRICE:
-                entry_price = pos.get('average_price', pos.get('avg_price', 0))
-                execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "JACKPOT (>92¢)")
+                entry_price = pos.get('average_price', 0)
+                execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "JACKPOT")
     except: pass
 
 def liquidate_winners(client):
-    print(f"--- 🌙 Night Shift: Liquidating Winners ---")
+    print(f"--- 🌙 Night Shift ---")
     try:
         positions = client.get_positions()
         for pos in positions:
@@ -266,7 +236,7 @@ def liquidate_winners(client):
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
             best_bid = ob['yes'][0][0]
-            entry_price = pos.get('average_price', pos.get('avg_price', 0))
+            entry_price = pos.get('average_price', 0)
             if best_bid > entry_price and best_bid > 5:
                 execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "NIGHT CASHOUT")
     except: pass
@@ -283,93 +253,110 @@ def manage_risk(client, city_ticker, current_forecast):
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
             current_bid = ob['yes'][0][0]
-            entry_price = pos.get('average_price', pos.get('avg_price', 0))
+            entry_price = pos.get('average_price', 0)
+            
             should_sell = False
             reason = ""
             if distance > 2.0:
                 is_profitable = current_bid > entry_price
                 is_market_confident = current_bid > 50
                 if is_profitable:
-                    should_sell = True
-                    reason = "PROFIT PROTECT (Forecast Shift)"
+                    should_sell = True; reason = "PROFIT PROTECT"
                 elif not is_market_confident:
-                    should_sell = True
-                    reason = "STOP LOSS (Forecast Shift)"
-            if should_sell:
-                execute_sell(client, pos['ticker'], pos['position'], current_bid, entry_price, reason)
+                    should_sell = True; reason = "STOP LOSS"
+            if should_sell: execute_sell(client, pos['ticker'], pos['position'], current_bid, entry_price, reason)
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Trader V29)...")
+    print("🚀 Bot Starting (V30 Chatty)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
-    
-    current_utc = datetime.utcnow().hour
-    current_est = (current_utc - 5) % 24
+    current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
     print(f"🕒 Time: {current_est}:00 EST | 🔒 Date: {target_date_str}")
     
     try:
         client = KalshiClient()
-        track_portfolio_value(client) # Log value for the separate report script
+        track_portfolio_value(client)
+        if client.get_balance() < MIN_BALANCE_CENTS: 
+            print("❌ Low Balance"); return
         
-        if client.get_balance() < MIN_BALANCE_CENTS: return
         check_daytime_profits(client)
         if current_est >= CASHOUT_HOUR:
-            liquidate_winners(client)
-            print(f"💤 Night Mode Active. Sleeping.")
-            return
-
-    except Exception as e:
-        print(f"❌ Login Error: {e}")
-        return
+            liquidate_winners(client); return
+            
+    except Exception as e: print(f"❌ Login Error: {e}"); return
 
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
         nws = get_nws_forecast(city['lat'], city['lon'])
         lamp = get_lamp_forecast(city['airport'])
-        if nws and lamp: safe_forecast = (nws + lamp) / 2
-        elif nws: safe_forecast = nws
-        elif lamp: safe_forecast = lamp
-        else: continue
-        print(f"   🎯 Target: {safe_forecast:.1f}°")
+        if not nws and not lamp: print("   ⚠️ No Weather Data"); continue
+        
+        safe_forecast = (nws + lamp) / 2 if (nws and lamp) else (nws or lamp)
+        print(f"   🎯 Forecast: {safe_forecast:.1f}°")
         
         manage_risk(client, city['ticker'], safe_forecast)
+        
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
-        except: continue
-        if not markets: continue
+        except: print("   ⚠️ API Error fetching markets"); continue
+        
+        if not markets: print("   ⚠️ No Open Markets Found"); continue
 
+        count_checked = 0
         for market in markets:
             if target_date_str not in market['ticker']: continue
+            count_checked += 1
+            
             try: strike = float(market['ticker'].split('-T')[-1])
             except: continue
+            
             distance = abs(safe_forecast - strike)
-            target_side = "no" 
+            
+            # --- DEBUG LOGGING ---
+            # Explicitly tell us why it's skipping
+            if distance > 1.5 and distance < 3.0:
+                print(f"   Skipping {strike}°: In Uncertainty Zone (Dist {distance:.1f})")
+                continue
+            
+            target_side = "no"
             if distance <= 1.5: target_side = "yes"
-            if target_side == "no" and distance < 3.0: continue
+            
+            if target_side == "no" and distance < 3.0:
+                print(f"   Skipping {strike}°: Too risky for NO (Dist {distance:.1f})")
+                continue
 
             ob = client.get_orderbook(market['ticker'])
-            if not ob: continue
+            if not ob: 
+                print(f"   Skipping {strike}°: Orderbook Empty")
+                continue
+                
             price = 0
             if target_side == "yes":
-                if not ob['no']: continue
+                if not ob['no']: 
+                    print(f"   Skipping {strike}°: No Sellers for YES")
+                    continue
                 price = 100 - ob['no'][0][0]
             else: 
-                if not ob['yes']: continue
+                if not ob['yes']: 
+                    print(f"   Skipping {strike}°: No Sellers for NO")
+                    continue
                 price = 100 - ob['yes'][0][0]
-            if price < MIN_PRICE or price > MAX_PRICE: continue
+
+            if price < MIN_PRICE or price > MAX_PRICE:
+                print(f"   Skipping {strike}°: Bad Price ({price}¢)")
+                continue
+
+            # Execution logic...
             qty = LOW_CONF_COUNT
             if target_side == "yes": qty = MED_CONF_COUNT
             if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT
-            try:
-                positions = client.get_positions()
-                curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
-                qty = min(qty, MAX_TOTAL_POS - abs(curr_pos))
-            except: qty = LOW_CONF_COUNT
-            if qty <= 0: continue
-
-            print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side.upper()}] @ {price}¢")
+            
+            print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} [{target_side}] @ {price}¢")
             execute_buy(client, market, qty, price, target_side, distance, safe_forecast)
+        
+        if count_checked == 0:
+            print(f"   ⚠️ Found markets, but none matched date '{target_date_str}'")
 
 if __name__ == "__main__":
     main()
