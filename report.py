@@ -10,7 +10,7 @@ from datetime import datetime
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
 
-# ✅ CITIES (Just for Names/Emojis)
+# ✅ CITIES
 CITIES = [
     { "name": "NOLA",    "emoji": "🎷" },
     { "name": "CHICAGO", "emoji": "🍕" },
@@ -30,10 +30,12 @@ def generate_trend_graph():
             reader = csv.reader(f)
             next(reader, None) # Skip header
             for row in reader:
+                if len(row) < 2: continue # Skip malformed rows
                 dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M")
                 dates.append(dt)
                 values.append(float(row[1]))
         
+        # Need at least one data point to plot
         if not values: return None
 
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -95,14 +97,16 @@ def send_daily_report():
         
     if not stats_text: stats_text = "No trades recorded yet."
 
-    # Get latest portfolio value
-    current_balance = 0
+    # Get latest portfolio value safely
+    current_balance = 0.0
     if os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE, 'r') as f:
-            for line in f: pass
-            last_line = line.strip().split(',')
-            try: current_balance = float(last_line[1])
-            except: pass
+            lines = f.readlines()
+            # Check if we have data beyond the header
+            if len(lines) > 1:
+                last_line = lines[-1].strip().split(',')
+                try: current_balance = float(last_line[1])
+                except: pass
 
     chart_file = generate_trend_graph()
     
@@ -110,9 +114,12 @@ def send_daily_report():
         "title": "📊 Daily CEO Report",
         "description": f"**Account Value:** ${current_balance:.2f}\n\n**🌍 City Performance (All-Time):**\n{stats_text}",
         "color": 3447003, # Blue
-        "image": {"url": "attachment://chart.png"},
         "timestamp": datetime.utcnow().isoformat()
     }
+    
+    # Only attach image if graph was generated
+    if chart_file:
+        embed["image"] = {"url": "attachment://chart.png"}
 
     files = {}
     if chart_file:
