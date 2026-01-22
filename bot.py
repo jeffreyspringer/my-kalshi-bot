@@ -105,14 +105,13 @@ class KalshiClient:
 def get_city_meta(ticker):
     """Finds city metadata from a ticker."""
     for city in CITIES:
-        # e.g. KXHIGHTNOLA is inside the ticker string
         clean_ticker = city['ticker'].replace("KXHIGHT", "").replace("KXHIGH", "")
         if clean_ticker in ticker:
             return city
     return {"name": "UNKNOWN", "emoji": "❓"}
 
 def update_city_stats(city_name, pnl_cents):
-    """Updates the persistent JSON file with PnL."""
+    """Updates the persistent JSON file with PnL and returns new total."""
     stats = {}
     if os.path.exists(STATS_FILE):
         try:
@@ -129,29 +128,49 @@ def update_city_stats(city_name, pnl_cents):
         
     return new_total
 
+def log_trade_csv(city_name, ticker, forecast, strike, gap, price, qty, action, pnl_cents, bankroll_cents):
+    """Writes a clean, Excel-friendly row."""
+    file_exists = os.path.isfile("trade_log.csv")
+    with open("trade_log.csv", "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            # ✅ NEW: Rich Headers
+            writer.writerow(["Date", "City", "Action", "Ticker", "Qty", "Price ($)", "PnL ($)", "City Bankroll ($)", "Forecast", "Gap"])
+        
+        # Format currency for Excel
+        price_str = f"${price/100:.2f}"
+        pnl_str = f"${pnl_cents/100:.2f}" if pnl_cents != 0 else "-"
+        bankroll_str = f"${bankroll_cents/100:.2f}"
+        forecast_str = f"{forecast}°" if forecast != "N/A" else "-"
+        gap_str = f"{gap:.1f}°" if isinstance(gap, float) else "-"
+        
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M"), 
+            city_name, 
+            action, 
+            ticker, 
+            qty, 
+            price_str, 
+            pnl_str, 
+            bankroll_str, 
+            forecast_str, 
+            gap_str
+        ])
+
 def send_rich_discord_alert(title, color, fields):
-    """Sends a formatted Embed to Discord."""
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
     
     payload = {
         "embeds": [{
             "title": title,
-            "color": color, # Decimal color code
+            "color": color,
             "fields": fields,
-            "footer": { "text": "Kalshi Weather Bot V23" },
+            "footer": { "text": "Kalshi Accountant V24" },
             "timestamp": datetime.utcnow().isoformat()
         }]
     }
     requests.post(webhook, json=payload)
-
-def log_trade_csv(ticker, forecast, strike, gap, price, qty, action):
-    file_exists = os.path.isfile("trade_log.csv")
-    with open("trade_log.csv", "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -194,20 +213,32 @@ def execute_buy(client, market, qty, price, target_side, distance, safe_forecast
     try:
         resp = client.place_order(market['ticker'], "buy", target_side, qty, price)
         if resp.status_code == 201:
-            log_trade_csv(market['ticker'], safe_forecast, 0, distance, price, qty, f"BUY_{target_side.upper()}")
-            
-            # Get current bankroll for display
+            # 1. Update JSON Stats (Buy doesn't change PnL, just reads bankroll)
             current_bankroll = update_city_stats(city_meta['name'], 0)
             
-            # Discord Embed (BLUE)
+            # 2. Log to Excel
+            log_trade_csv(
+                city_meta['name'], 
+                market['ticker'], 
+                safe_forecast, 
+                0, # Strike hard to parse here, unused in new log
+                distance, 
+                price, 
+                qty, 
+                f"BUY {target_side.upper()}", 
+                0, 
+                current_bankroll
+            )
+            
+            # 3. Discord
             fields = [
                 {"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True},
                 {"name": "Contract", "value": f"`{market['ticker']}`", "inline": True},
                 {"name": "Order", "value": f"Buy **{qty}x {target_side.upper()}** @ {price}¢", "inline": False},
-                {"name": "Logic", "value": f"Forecast {safe_forecast:.1f}° (Dist {distance:.1f}°)", "inline": False},
+                {"name": "Stats", "value": f"Forecast {safe_forecast:.1f}° (Dist {distance:.1f}°)", "inline": False},
                 {"name": "City Bankroll", "value": f"${current_bankroll/100:.2f}", "inline": True}
             ]
-            send_rich_discord_alert("🚀 BUY ORDER EXECUTED", 3447003, fields) # Blue
+            send_rich_discord_alert("🚀 BUY ORDER EXECUTED", 3447003, fields)
     except Exception as e:
         print(f"Buy Error: {e}")
 
@@ -220,10 +251,24 @@ def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
     try:
         resp = client.place_order(ticker, "sell", "yes", qty, sell_price)
         if resp.status_code == 201:
+            # 1. Update JSON Stats
             new_total = update_city_stats(city_meta['name'], gross_pnl_cents)
-            log_trade_csv(ticker, "N/A", 0, 0, sell_price, qty, "SELL")
             
-            # Determine Color (Green for Profit, Red for Loss)
+            # 2. Log to Excel
+            log_trade_csv(
+                city_meta['name'], 
+                ticker, 
+                "N/A", 
+                0, 
+                0, 
+                sell_price, 
+                qty, 
+                "SELL", 
+                gross_pnl_cents, 
+                new_total
+            )
+            
+            # 3. Discord
             color = 5763719 if gross_pnl_cents >= 0 else 15548997
             emoji = "🤑" if gross_pnl_cents >= 0 else "⚠️"
             pnl_str = f"+${gross_pnl_cents/100:.2f}" if gross_pnl_cents >= 0 else f"-${abs(gross_pnl_cents)/100:.2f}"
@@ -308,7 +353,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Rich Stats V23)...")
+    print("🚀 Bot Starting (Accountant V24)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
