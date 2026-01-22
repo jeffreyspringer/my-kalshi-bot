@@ -22,6 +22,8 @@ PROFIT_TAKE_PRICE = 92
 FEE_BUFFER = 3
 MIN_PRICE = 20
 MAX_PRICE = 80
+
+# CONFIDENCE SCALING
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
@@ -63,7 +65,6 @@ def get_nws_forecast(lat, lon):
         point_url = f"https://api.weather.gov/points/{lat},{lon}"
         point_res = requests.get(point_url, headers=headers).json()
         if 'status' in point_res and point_res['status'] >= 400:
-            print(f"⚠️ NWS Point Error: {point_res}")
             return None
             
         forecast_url = point_res['properties']['forecast']
@@ -98,7 +99,7 @@ def check_for_profit_taking(portfolio_api, market_api):
                     log_trade(pos.ticker, "N/A", "N/A", 0, best_bid, pos.position, "SELL_PROFIT")
                     send_discord_alert(f"💰 **Profit Taken!** Sold {pos.position}x {pos.ticker} at **{best_bid}¢**")
     except Exception as e:
-        print(f"Profit Taking Skip (No positions or error): {e}")
+        print(f"Profit Taking Skip: {e}")
 
 def main():
     print("🚀 Bot Starting...")
@@ -108,14 +109,36 @@ def main():
         print("🛑 Trading DISABLED via Env Var.")
         return
 
-    # 1. Setup
+    # 1. Credentials
     api_key_id = os.getenv("KALSHI_KEY")
     private_key_pem = os.getenv("KALSHI_PRIVATE_KEY")
+    
     if not api_key_id or not private_key_pem: 
         print("❌ CRITICAL: Missing API Keys in Secrets!")
         return
 
+    # --- 🛠️ KEY REPAIR STATION 🛠️ ---
+    # This automatically fixes keys broken by GitHub Secrets formatting
+    if private_key_pem:
+        # Replace literal "\n" characters with actual newlines
+        private_key_pem = private_key_pem.replace('\\n', '\n')
+        
+        # Ensure headers have correct spacing
+        if "-----BEGIN RSA PRIVATE KEY-----" in private_key_pem:
+             private_key_pem = private_key_pem.replace("-----BEGIN RSA PRIVATE KEY----- ", "-----BEGIN RSA PRIVATE KEY-----\n")
+             private_key_pem = private_key_pem.replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----\n")
+             # Fix double newlines if we added too many
+             private_key_pem = private_key_pem.replace("-----\n\n", "-----\n")
+
+        if "-----END RSA PRIVATE KEY-----" in private_key_pem:
+             private_key_pem = private_key_pem.replace(" -----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----")
+             private_key_pem = private_key_pem.replace("-----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----")
+             # Fix double newlines
+             private_key_pem = private_key_pem.replace("\n\n-----", "\n-----")
+    # ------------------------------------
+
     try:
+        # Using the Elections URL which was resolving correctly for you
         config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
         config.api_key_id = api_key_id
         config.private_key_pem = private_key_pem
@@ -138,8 +161,8 @@ def main():
             return
         check_for_profit_taking(portfolio_api, market_api)
     except Exception as e: 
-        print(f"❌ CRITICAL ERROR in Risk Checks (Likely Bad Keys): {e}")
-        # We print the error and STOP here so you can see it
+        print(f"❌ CRITICAL ERROR in Risk Checks: {e}")
+        print("💡 TIP: If this is still 401, verify your KALSHI_KEY is the UUID (e.g., 123-abc) and NOT the file name.")
         return
 
     # --- MAIN CITY LOOP ---
@@ -181,7 +204,6 @@ def main():
                 elif gap >= 3.0: qty, label = MED_CONF_COUNT, "MED"
                 else: qty, label = LOW_CONF_COUNT, "LOW"
                 
-                # Position Check
                 try:
                     pos_res = portfolio_api.get_positions()
                     curr_pos = next((p.position for p in pos_res.market_positions if p.ticker == market.ticker), 0)
@@ -190,7 +212,6 @@ def main():
                 qty = min(qty, MAX_TOTAL_POS - curr_pos)
                 if qty <= 0: continue
 
-                # Orderbook Check
                 try:
                     orderbook = market_api.get_market_orderbook(market.ticker)
                     if not orderbook.orderbook.no: continue
