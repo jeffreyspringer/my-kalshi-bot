@@ -52,11 +52,10 @@ class KalshiClient:
     def _req(self, method, path, body=None):
         timestamp = str(int(time.time() * 1000))
         
-        # ✅ FIX: Force compact JSON (no spaces)
-        # separators=(',', ':') removes the whitespace Python adds by default
+        # ✅ FIX: Canonical JSON (Sorted Keys + No Spaces)
         json_str = ""
         if body:
-            json_str = json.dumps(body, separators=(',', ':'))
+            json_str = json.dumps(body, sort_keys=True, separators=(',', ':'))
             
         # Sign the EXACT string we are about to send
         msg_str = f"{timestamp}{method}/trade-api/v2{path}{json_str}"
@@ -79,11 +78,11 @@ class KalshiClient:
         if method == "GET": 
             return self.session.get(url, headers=headers, timeout=10)
         
-        # ✅ FIX: Send the string as 'data', NOT 'json'
-        # This prevents the requests library from re-adding spaces
-        return self.session.post(url, headers=headers, data=json_str, timeout=10)
+        # ✅ FIX: Send the string as raw 'data' bytes
+        return self.session.post(url, headers=headers, data=json_str.encode('utf-8'), timeout=10)
 
     def place_order(self, ticker, action, side, count, price):
+        # Explicit types ensure 'price' doesn't become a float (e.g. 96.0)
         body = {
             "action": action, 
             "count": int(count), 
@@ -101,13 +100,13 @@ class KalshiClient:
             print(f"   ✅ ORDER SUCCESS: {ticker} @ {price}¢ [ID: {res.json().get('order_id')}]")
         else:
             print(f"   ❌ REJECTED: {res.status_code}")
-            # If rejected again, seeing the Compact Payload will confirm the fix
-            print(f"   ⚠️ Payload sent: {json.dumps(body, separators=(',', ':'))}") 
+            # Print the Exact string we tried to sign/send
+            print(f"   ⚠️ Payload Sent: {json.dumps(body, sort_keys=True, separators=(',', ':'))}")
             print(f"   ⚠️ Response: {res.text}")
             
         return res
 
-# --- UTILS ---
+# --- UTILS (No changes) ---
 def get_today_high_so_far(airport_code, tz_offset):
     try:
         headers = {'User-Agent': '(KalshiBot)'}
@@ -125,7 +124,7 @@ def get_today_high_so_far(airport_code, tz_offset):
     except: return 0
 
 def main():
-    print("🚀 Bot Starting (V50 Strict Serializer)...")
+    print("🚀 Bot Starting (V50 Canonical JSON)...")
     client = KalshiClient()
     target_date_str = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%y%b%d").upper()
     
