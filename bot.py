@@ -13,11 +13,10 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21   # 9 PM EST
-REPORT_HOUR = 1     # 1 AM EST
+CASHOUT_HOUR = 21   
+REPORT_HOUR = 1     
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
-REPORT_TRACKER = "last_report_date.txt"
 
 # ✅ CITIES
 CITIES = [
@@ -198,8 +197,8 @@ def send_daily_report(client, current_balance):
     # ⚠️ CRITICAL: Uses a Different Webhook for the Report Channel
     webhook = os.getenv("DISCORD_REPORT_WEBHOOK_URL")
     if not webhook: 
-        print("   ⚠️ No Report Webhook found. Skipping.")
-        return
+        print("   ⚠️ No Report Webhook found. Using Standard Webhook instead.")
+        webhook = os.getenv("DISCORD_WEBHOOK_URL")
 
     city_stats = {}
     if os.path.exists(STATS_FILE):
@@ -235,13 +234,12 @@ def send_daily_report(client, current_balance):
 # --- DISCORD ALERTS (TRADES) ---
 
 def send_rich_discord_alert(title, color, fields):
-    # ⚠️ CRITICAL: Uses the Standard Webhook for Trades
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
     payload = {
         "embeds": [{
             "title": title, "color": color, "fields": fields,
-            "footer": { "text": "Kalshi Bot V26" }, "timestamp": datetime.utcnow().isoformat()
+            "footer": { "text": "Kalshi Bot V26.1" }, "timestamp": datetime.utcnow().isoformat()
         }]
     }
     requests.post(webhook, json=payload)
@@ -377,34 +375,25 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Dual-Channel V26)...")
+    print("🚀 Bot Starting (Force Report V26.1)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
     current_est = (current_utc - 5) % 24
-    today_str = datetime.now().strftime("%Y-%m-%d")
     target_date_str = get_target_date_str()
-    print(f"🕒 Time: {current_est}:00 EST | 🔒 Date: {target_date_str}")
     
     try:
         client = KalshiClient()
         current_balance = track_portfolio_value(client) 
         if current_balance < MIN_BALANCE_CENTS: return
         
-        # --- REPORTING (To Second Channel) ---
-        if current_est == REPORT_HOUR:
-            last_report = ""
-            if os.path.exists(REPORT_TRACKER):
-                with open(REPORT_TRACKER, "r") as f: last_report = f.read().strip()
-            
-            if last_report != today_str:
-                send_daily_report(client, current_balance)
-                with open(REPORT_TRACKER, "w") as f: f.write(today_str)
+        # ⚠️ FORCE REPORT RUN (Ignoring Time Check)
+        # This will prove the new code works.
+        send_daily_report(client, current_balance)
 
         check_daytime_profits(client)
         if current_est >= CASHOUT_HOUR:
             liquidate_winners(client)
-            print(f"💤 Night Mode Active. Sleeping.")
             return
 
     except Exception as e:
