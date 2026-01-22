@@ -14,10 +14,11 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21   
-REPORT_HOUR = 1     
+CASHOUT_HOUR = 21   # 9 PM EST: Stop trading, sell winners
+REPORT_HOUR = 23    # 11 PM EST: Send Daily CEO Report
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
+REPORT_TRACKER = "last_report_date.txt"
 
 # ✅ CITIES
 CITIES = [
@@ -154,7 +155,6 @@ def track_portfolio_value(client):
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(["Date", "Total Value ($)"])
-            # Log with full timestamp for precision
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), total_value_cents/100])
             
         return total_value_cents
@@ -173,41 +173,31 @@ def generate_trend_graph():
             reader = csv.reader(f)
             next(reader, None) # Skip header
             for row in reader:
-                # Parse Date from String
                 dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M")
                 dates.append(dt)
                 values.append(float(row[1]))
         
         if not values: return None
 
-        # Create Plot
         fig, ax = plt.subplots(figsize=(10, 5))
-        
-        # Plot Data
         ax.plot_date(dates, values, linestyle='-', marker='o', color='#00d2be', linewidth=2, markersize=6)
         
-        # Formatting
         ax.set_title('Portfolio Value Trend', color='white', fontsize=14, pad=15)
         ax.set_ylabel('Value ($)', color='white', fontsize=12)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+        fig.autofmt_xdate()
         
-        # X-Axis Date Formatting
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d')) # e.g. "Jan 22"
-        fig.autofmt_xdate() # Auto-rotate dates to prevent overlap
-        
-        # Dark Mode Styling
         ax.set_facecolor('#2f3136')
         fig.patch.set_facecolor('#2f3136')
         ax.tick_params(axis='x', colors='white')
         ax.tick_params(axis='y', colors='white')
         ax.grid(color='#40444b', linestyle='--', alpha=0.5)
         
-        # Remove spines (borders) for cleaner look
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_color('white')
         ax.spines['left'].set_color('white')
         
-        # Save
         filename = "chart.png"
         plt.savefig(filename, bbox_inches='tight', dpi=100)
         plt.close()
@@ -234,7 +224,6 @@ def send_daily_report(client, current_balance):
         pnl = city_stats.get(city['name'], 0)
         emoji_city = city['emoji']
         
-        # COLOR LOGIC (Using Emojis)
         if pnl > 0:
             status_dot = "🟢"
             pnl_fmt = f"+${pnl/100:.2f}"
@@ -254,7 +243,7 @@ def send_daily_report(client, current_balance):
     embed = {
         "title": "📊 Daily CEO Report",
         "description": f"**Account Value:** ${current_balance/100:.2f}\n\n**🌍 City Performance (All-Time):**\n{stats_text}",
-        "color": 3447003, # Blue
+        "color": 3447003, 
         "image": {"url": "attachment://chart.png"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -274,7 +263,7 @@ def send_rich_discord_alert(title, color, fields):
     payload = {
         "embeds": [{
             "title": title, "color": color, "fields": fields,
-            "footer": { "text": "Kalshi Bot V27" }, "timestamp": datetime.utcnow().isoformat()
+            "footer": { "text": "Kalshi Bot V28" }, "timestamp": datetime.utcnow().isoformat()
         }]
     }
     requests.post(webhook, json=payload)
@@ -410,24 +399,36 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Visual Final V27)...")
+    print("🚀 Bot Starting (V28 Final)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
     current_est = (current_utc - 5) % 24
+    today_str = datetime.now().strftime("%Y-%m-%d")
     target_date_str = get_target_date_str()
+    
+    print(f"🕒 Time: {current_est}:00 EST | 🔒 Date: {target_date_str}")
     
     try:
         client = KalshiClient()
         current_balance = track_portfolio_value(client) 
         if current_balance < MIN_BALANCE_CENTS: return
         
-        # ⚠️ FORCE REPORT for Testing
-        send_daily_report(client, current_balance)
+        # --- CEO REPORT (Runs only at 11 PM EST) ---
+        if current_est == REPORT_HOUR:
+            last_report = ""
+            if os.path.exists(REPORT_TRACKER):
+                with open(REPORT_TRACKER, "r") as f: last_report = f.read().strip()
+            
+            # Ensure we haven't already reported for "2026-01-24"
+            if last_report != today_str:
+                send_daily_report(client, current_balance)
+                with open(REPORT_TRACKER, "w") as f: f.write(today_str)
 
         check_daytime_profits(client)
         if current_est >= CASHOUT_HOUR:
             liquidate_winners(client)
+            print(f"💤 Night Mode Active. Sleeping.")
             return
 
     except Exception as e:
