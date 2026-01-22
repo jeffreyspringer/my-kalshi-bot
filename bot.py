@@ -35,6 +35,8 @@ MAX_PRICE = 98
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
+# 👇 LOWERED SAFETY BUFFER (Was 1.5, now 1.2 to allow more trades)
+SAFETY_BUFFER = 1.2 
 
 class KalshiClient:
     def __init__(self):
@@ -143,7 +145,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V36 (LAMP Fix)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V37 (Action Mode)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -163,10 +165,12 @@ def get_nws_forecast(lat, lon):
 
 def get_lamp_forecast(airport_code):
     try:
-        # ✅ FIX: Sending User-Agent to avoid 403 Forbidden error
+        # ✅ FIX 1: Send User-Agent to pass NWS security check
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
-        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt"
-        res = requests.get(url, headers=headers)
+        # ✅ FIX 2: Use UPPERCASE filename (Unix servers are case-sensitive)
+        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.upper()}.txt"
+        
+        res = requests.get(url, headers=headers, timeout=10)
         
         if res.status_code != 200: 
             print(f"   [LAMP ERROR] {airport_code} Status: {res.status_code}")
@@ -259,7 +263,6 @@ def manage_risk(client, city_ticker, current_forecast):
         for pos in positions:
             if city_ticker not in pos['ticker']: continue
             if pos['position'] <= 0: continue
-            # Improved strike parsing for risk management too
             try: strike = float(re.findall(r"(\d+(?:\.\d+)?)", pos['ticker'])[-1])
             except: continue
             
@@ -282,7 +285,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V36 LAMP Fix)...")
+    print("🚀 Bot Starting (V37 Action Mode)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -336,8 +339,9 @@ def main():
             delta = safe_forecast - strike
             
             target_side = "none"
-            if delta > 1.5: target_side = "yes"
-            elif delta < -1.5: target_side = "no"
+            # 👇 Relaxed checks using SAFETY_BUFFER (1.2 instead of 1.5)
+            if delta > SAFETY_BUFFER: target_side = "yes"
+            elif delta < -SAFETY_BUFFER: target_side = "no"
             else:
                 print(f"   Skipping {strike}° ({ticker}): Too Close (Delta {delta:.1f})")
                 continue
