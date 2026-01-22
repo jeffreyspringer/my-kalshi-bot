@@ -1,89 +1,75 @@
 import os
 import json
+import time
+import base64
 import requests
-import kalshi_python
 from datetime import datetime
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-# --- CONFIGURATION ---
 HISTORY_FILE = "balance_history.json"
-INITIAL_DEPOSIT = 100.00 
+HOST = "https://api.elections.kalshi.com"
 
-def send_discord_report(current_val, change_val, change_pct, total_cash, total_positions):
-    # UPDATED: Look for the REPORT webhook first
-    webhook_url = os.getenv("DISCORD_REPORT_WEBHOOK_URL")
+def get_raw_balance():
+    key_id = os.getenv("KALSHI_KEY", "").strip()
+    key_str = os.getenv("KALSHI_PRIVATE_KEY", "").strip().replace('\\n', '\n')
+    if "-----BEGIN" not in key_str:
+        key_str = f"-----BEGIN RSA PRIVATE KEY-----\n{key_str}\n-----END RSA PRIVATE KEY-----"
     
-    # Fallback: If the new secret isn't there, use the old one so it doesn't break
-    if not webhook_url:
-        webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-        
-    if not webhook_url: return
+    private_key = load_pem_private_key(key_str.encode(), password=None)
+    timestamp = str(int(time.time() * 1000))
+    path = "/trade-api/v2/portfolio/balance"
+    msg = f"{timestamp}GET{path}"
+    
+    signature = private_key.sign(
+        msg.encode('utf-8'),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+        hashes.SHA256()
+    )
+    headers = {
+        "KALSHI-ACCESS-KEY": key_id,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'),
+        "KALSHI-ACCESS-TIMESTAMP": timestamp
+    }
+    return requests.get(f"{HOST}{path}", headers=headers).json().get("balance", 0)
 
-    color = 3066993 if change_val >= 0 else 15158332
-    emoji = "📈" if change_val >= 0 else "📉"
+def send_discord_report(curr, change, pct):
+    webhook = os.getenv("DISCORD_REPORT_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook: return
     
+    emoji = "📈" if change >= 0 else "📉"
+    color = 3066993 if change >= 0 else 15158332
     embed = {
         "title": f"{emoji} Daily Account Report",
         "color": color,
         "fields": [
-            {"name": "Total Value", "value": f"**${current_val:,.2f}**", "inline": True},
-            {"name": "24h Change", "value": f"${change_val:,.2f} ({change_pct:+.2f}%)", "inline": True},
-            {"name": "\u200b", "value": "\u200b", "inline": False},
-            {"name": "Cash Hand", "value": f"${total_cash:,.2f}", "inline": True},
-            {"name": "Active Positions", "value": f"${total_positions:,.2f}", "inline": True}
-        ],
-        "footer": {"text": f"Date: {datetime.now().strftime('%Y-%m-%d')}"}
+            {"name": "Total Value", "value": f"**${curr/100:,.2f}**", "inline": True},
+            {"name": "24h Change", "value": f"${change/100:,.2f} ({pct:+.2f}%)", "inline": True}
+        ]
     }
-
-    payload = {"embeds": [embed]}
-    try:
-        requests.post(webhook_url, json=payload)
-    except Exception as e:
-        print(f"Discord Error: {e}")
+    requests.post(webhook, json={"embeds": [embed]})
 
 def main():
-    api_key_id = os.getenv("KALSHI_KEY")
-    private_key_pem = os.getenv("KALSHI_PRIVATE_KEY")
-    
-    config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
-    config.api_key_id = api_key_id
-    config.private_key_pem = private_key_pem
-    
     try:
-        api_client = kalshi_python.ApiClient(config)
-        portfolio_api = kalshi_python.PortfolioApi(api_client)
-        
-        balance_data = portfolio_api.get_balance()
-        cash = balance_data.balance / 100
-        # If 'portfolio_value' is missing in your SDK version, calculate manually
-        positions_val = getattr(balance_data, 'portfolio_value', 0) / 100 
-        
-        total_value = cash + positions_val 
-        
+        total_balance = get_raw_balance() # In cents
     except Exception as e:
-        print(f"API Error: {e}")
+        print(f"Error fetching balance: {e}")
         return
 
-    # Load History
-    last_value = INITIAL_DEPOSIT
-    try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r") as f:
-                data = json.load(f)
-                last_value = data.get("last_value", INITIAL_DEPOSIT)
-    except Exception as e:
-        print(f"History Read Error: {e}")
+    last_val = 10000 # Default to $100.00 (in cents)
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            last_val = json.load(f).get("last_value", 10000)
 
-    # Calculate PnL
-    change_val = total_value - last_value
-    change_pct = (change_val / last_value) * 100 if last_value != 0 else 0
-
-    print(f"Today: ${total_value} | Yesterday: ${last_value} | Change: {change_pct}%")
-
-    send_discord_report(total_value, change_val, change_pct, cash, positions_val)
-
-    # Save Today's Value
+    change = total_balance - last_val
+    pct = (change / last_val) * 100 if last_val != 0 else 0
+    
+    print(f"Balance: {total_balance}¢ | Change: {pct}%")
+    send_discord_report(total_balance, change, pct)
+    
     with open(HISTORY_FILE, "w") as f:
-        json.dump({"last_value": total_value, "date": str(datetime.now())}, f)
+        json.dump({"last_value": total_balance, "date": str(datetime.now())}, f)
 
 if __name__ == "__main__":
     main()
