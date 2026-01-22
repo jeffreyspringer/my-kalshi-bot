@@ -52,35 +52,53 @@ class KalshiClient:
     def _req(self, method, path, body=None):
         timestamp = str(int(time.time() * 1000))
         msg = f"{timestamp}{method}/trade-api/v2{path}"
-        if body: msg += json.dumps(body, separators=(',', ':'))
-        signature = self.private_key.sign(msg.encode('utf-8'), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
-        headers = {"KALSHI-ACCESS-KEY": self.key_id, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'), "KALSHI-ACCESS-TIMESTAMP": timestamp, "Content-Type": "application/json"}
+        
+        # ✅ CRITICAL: Ensure JSON is serialized identically for signing and sending
+        json_body = ""
+        if body:
+            json_body = json.dumps(body, separators=(',', ':'))
+            msg += json_body
+
+        signature = self.private_key.sign(
+            msg.encode('utf-8'),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+        
+        headers = {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "Content-Type": "application/json"
+        }
+        
         url = f"{HOST}/trade-api/v2{path}"
-        if method == "GET": return self.session.get(url, headers=headers, timeout=10)
-        return self.session.post(url, headers=headers, json=body, timeout=10)
+        if method == "GET": 
+            return self.session.get(url, headers=headers, timeout=10)
+        # ✅ CRITICAL: Use the same json_body string we just signed
+        return self.session.post(url, headers=headers, data=json_body, timeout=10)
 
     def place_order(self, ticker, action, side, count, price):
+        # Build the exact order object
         body = {
             "action": action, 
-            "count": count, 
+            "count": int(count), 
             "type": "limit", 
             "ticker": ticker, 
             "side": side, 
-            "yes_price": price if side == "yes" else 0, 
-            "no_price": price if side == "no" else 0, 
             "client_order_id": str(uuid.uuid4())
         }
-        if side == "yes": del body["no_price"]
-        else: del body["yes_price"]
+        if side == "yes": body["yes_price"] = int(price)
+        else: body["no_price"] = int(price)
         
-        # ✅ VERIFICATION: Check the response status
         res = self._req("POST", "/portfolio/orders", body)
         if res.status_code == 201:
-            print(f"   ✅ ORDER CREATED: {ticker} (ID: {res.json().get('order_id')})")
+            print(f"   ✅ ORDER SUCCESS: {ticker} @ {price}¢")
         else:
-            print(f"   ❌ ORDER REJECTED: {res.status_code} - {res.text}")
+            print(f"   ❌ REJECTED: {res.status_code} - {res.text}")
         return res
 
+# --- UTILS (NO CHANGES) ---
 def get_today_high_so_far(airport_code, tz_offset):
     try:
         headers = {'User-Agent': '(KalshiBot)'}
@@ -98,17 +116,14 @@ def get_today_high_so_far(airport_code, tz_offset):
     except: return 0
 
 def main():
-    print("🚀 Bot Starting (V47 Debugger)...")
+    print("🚀 Bot Starting (V48 Signature Fix)...")
     client = KalshiClient()
     target_date_str = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%y%b%d").upper()
     
-    # Pre-fetch balance to ensure session works
-    try:
-        balance_res = client._req("GET", "/portfolio/balance")
-        balance_res.raise_for_status()
-        print(f"💰 Account Balance: ${balance_res.json().get('balance', 0)/100:.2f}")
-    except Exception as e:
-        print(f"⚠️ Could not fetch balance: {e}")
+    # Check Balance
+    bal_res = client._req("GET", "/portfolio/balance")
+    if bal_res.status_code == 200:
+        print(f"💰 Account Balance: ${bal_res.json().get('balance', 0)/100:.2f}")
 
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
@@ -122,8 +137,7 @@ def main():
             print(f"   🎯 Target: {safe_forecast:.1f}°")
         except: continue
 
-        markets_res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
-        markets = markets_res.json().get("markets", [])
+        markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
 
         for market in markets:
             if target_date_str not in market['ticker']: continue
@@ -134,17 +148,18 @@ def main():
             target_side = "yes" if diff <= 0.6 else ("no" if diff >= 1.8 else "none")
             if target_side == "none": continue
 
-            # Pricing logic using last trade as baseline
+            # Dynamic pricing using market bids
             if target_side == "yes":
-                price = market.get('yes_bid', 0) + 2 
-                if price <= 2: price = market.get('last_price', 20)
+                price = market.get('yes_bid', 0) + 1
+                if price <= 1: price = market.get('last_price', 20)
             else:
-                price = market.get('no_bid', 0) + 2
-                if price <= 2: price = (100 - market.get('last_price', 80))
+                price = market.get('no_bid', 0) + 1
+                if price <= 1: price = (100 - market.get('last_price', 80))
 
             if price < MIN_PRICE or price > MAX_PRICE: continue
             
-            print(f"   🚀 Attempting {target_side.upper()} for {strike}° @ {price}¢")
+            print(f"   🚀 Buying {target_side.upper()} for {strike}° @ {price}¢")
             client.place_order(market['ticker'], "buy", target_side, LOW_CONF_COUNT, price)
+            time.sleep(0.5) # Anti-spam delay
 
 if __name__ == "__main__": main()
