@@ -27,7 +27,7 @@ MIN_BALANCE_CENTS = 500
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
 FEE_BUFFER = 3
-MIN_PRICE = 2              # We want to buy cheap "No" bets too
+MIN_PRICE = 2              
 MAX_PRICE = 98
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
@@ -141,6 +141,7 @@ def get_lamp_forecast(airport_code):
     except: return None
 
 def check_profits(client):
+    """Sells winners if they hit our profit target."""
     print("--- 💰 Checking Profit Taking ---")
     try:
         positions = client.get_positions()
@@ -158,8 +159,57 @@ def check_profits(client):
                 except: pass
     except: pass
 
+def manage_risk(client, city_ticker, current_forecast):
+    """Sells OLD positions that no longer match the NEW forecast."""
+    try:
+        positions = client.get_positions()
+        for pos in positions:
+            # Only check positions for THIS city
+            if city_ticker not in pos['ticker']: continue
+            if pos['position'] <= 0: continue
+            
+            try:
+                strike = float(pos['ticker'].split('-T')[-1])
+            except: continue
+            
+            # Distance from NEW forecast
+            distance = abs(current_forecast - strike)
+            
+            # --- LOGIC: WHEN TO BAIL OUT ---
+            should_sell = False
+            reason = ""
+            
+            # 1. We hold YES, but forecast moved away (Distance > 2.0)
+            # NOTE: We can't easily tell if we hold YES or NO from 'position' alone 
+            # (Kalshi nets them out). Positive position usually means we are Long Yes.
+            # If we bought "No", we are actually Short Yes (negative position) or 
+            # holding "No" contracts.
+            # Kalshi API V2: 'position' > 0 usually means Long Yes. 
+            # If we bought NO contracts, we hold "No" side. The API reports this differently.
+            # Assuming 'market_positions' returns positive integers and a 'side'?
+            # Actually, standard portfolio returns net position.
+            # CRITICAL: For this bot, we assume Position > 0 means we own the contract displayed.
+            
+            # SIMPLIFIED RISK LOGIC:
+            # If we own YES (Bullseye bet), but distance is now > 2.5, SELL.
+            if distance > 2.5:
+                should_sell = True
+                reason = f"Forecast moved! Dist is now {distance:.1f}°"
+            
+            if should_sell:
+                ob = client.get_orderbook(pos['ticker'])
+                if not ob or not ob['yes']: continue
+                best_bid = ob['yes'][0][0]
+                
+                print(f"   ⚠️ RISK ALERT: Selling {pos['ticker']} ({reason}) @ {best_bid}¢")
+                client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
+                send_discord_alert(f"⚠️ **Risk Mgmt**: Dumped {pos['ticker']} @ {best_bid}¢. {reason}")
+
+    except Exception as e:
+        print(f"   Risk Check Error: {e}")
+
 def main():
-    print("🚀 Bot Starting (Sniper Mode V16)...")
+    print("🚀 Bot Starting (Active Manager V17)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -180,64 +230,46 @@ def main():
         else: continue
             
         print(f"   🎯 Target: {safe_forecast:.1f}°")
+        
+        # 1. CLEAN HOUSE FIRST (Sell bad bets based on new target)
+        manage_risk(client, city['ticker'], safe_forecast)
 
         try:
             markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: continue
         
-        if not markets: 
-            print("   No markets.")
-            continue
+        if not markets: continue
 
         for market in markets:
             try:
-                # Assuming ticker ends with -T70 (Strike)
                 strike = float(market['ticker'].split('-T')[-1])
             except: continue
 
-            # --- SNIPER LOGIC (BIN STRATEGY) ---
-            # Distance: How far is this bin from our Forecast?
             distance = abs(safe_forecast - strike)
-            
-            # DEFAULT: Assume this bin is WRONG (Buy No)
             target_side = "no" 
-            label = "FAR_OFF"
-
-            # IF distance is very small (It's the Bullseye), we Buy YES
-            if distance <= 1.5:
-                target_side = "yes"
-                label = "BULLSEYE"
             
-            # --- FILTERING ---
-            # If it's a "No" bet, we want a nice safe distance (e.g. > 3 degrees away)
-            # If it's too close (e.g. 2 degrees), it's risky. Skip.
-            if target_side == "no" and distance < 3.0:
-                print(f"   Skipping {market['ticker']}: Too close to call (Dist {distance:.1f}°).")
-                continue
+            if distance <= 1.5: target_side = "yes"
+            
+            # Filters
+            if target_side == "no" and distance < 3.0: continue
 
-            # --- PRICING ---
             ob = client.get_orderbook(market['ticker'])
             if not ob: continue
 
             price = 0
             if target_side == "yes":
                 if not ob['no']: continue
-                price = 100 - ob['no'][0][0] # Cost to buy Yes
+                price = 100 - ob['no'][0][0]
             else: 
                 if not ob['yes']: continue
-                price = 100 - ob['yes'][0][0] # Cost to buy No
+                price = 100 - ob['yes'][0][0]
 
-            # --- EXECUTION ---
-            if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   Skipping {market['ticker']} ({target_side.upper()}): Price {price}¢ bad.")
-                continue
+            if price < MIN_PRICE or price > MAX_PRICE: continue
 
-            # Sizing
             qty = LOW_CONF_COUNT
-            if target_side == "yes": qty = MED_CONF_COUNT # Be modest on Bullseyes
-            if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT # Be aggressive on "Obvious Nos"
+            if target_side == "yes": qty = MED_CONF_COUNT
+            if target_side == "no" and distance >= 5.0: qty = HIGH_CONF_COUNT
 
-            # Position Check
             try:
                 positions = client.get_positions()
                 curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
@@ -252,7 +284,7 @@ def main():
                 resp = client.place_order(market['ticker'], "buy", target_side, qty, price)
                 if resp.status_code == 201:
                     log_trade(market['ticker'], safe_forecast, strike, distance, price, qty, f"BUY_{target_side.upper()}")
-                    send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} **{target_side.upper()}** @ {price}¢ (Dist {distance:.1f})")
+                    send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} **{target_side.upper()}** @ {price}¢")
             except: pass
 
 if __name__ == "__main__":
