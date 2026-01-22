@@ -6,6 +6,7 @@ import time
 import json
 import base64
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -153,6 +154,7 @@ def track_portfolio_value(client):
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(["Date", "Total Value ($)"])
+            # Log with full timestamp for precision
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), total_value_cents/100])
             
         return total_value_cents
@@ -161,30 +163,53 @@ def track_portfolio_value(client):
 # --- CEO REPORT GENERATION ---
 
 def generate_trend_graph():
-    dates, values = [], []
+    dates = []
+    values = []
+    
     if not os.path.exists(PORTFOLIO_FILE): return None
+    
     try:
         with open(PORTFOLIO_FILE, 'r') as f:
             reader = csv.reader(f)
-            next(reader, None)
+            next(reader, None) # Skip header
             for row in reader:
-                dates.append(row[0])
+                # Parse Date from String
+                dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M")
+                dates.append(dt)
                 values.append(float(row[1]))
+        
         if not values: return None
 
-        plt.figure(figsize=(10, 5))
-        plt.plot(values, marker='o', linestyle='-', color='#00d2be', linewidth=2)
-        plt.title('Portfolio Value Trend', color='white')
-        plt.xlabel('Time', color='white')
-        plt.ylabel('Value ($)', color='white')
-        plt.gca().set_facecolor('#2f3136')
-        plt.gcf().patch.set_facecolor('#2f3136')
-        plt.tick_params(axis='x', colors='white')
-        plt.tick_params(axis='y', colors='white')
-        plt.grid(color='#40444b', linestyle='--')
+        # Create Plot
+        fig, ax = plt.subplots(figsize=(10, 5))
         
+        # Plot Data
+        ax.plot_date(dates, values, linestyle='-', marker='o', color='#00d2be', linewidth=2, markersize=6)
+        
+        # Formatting
+        ax.set_title('Portfolio Value Trend', color='white', fontsize=14, pad=15)
+        ax.set_ylabel('Value ($)', color='white', fontsize=12)
+        
+        # X-Axis Date Formatting
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d')) # e.g. "Jan 22"
+        fig.autofmt_xdate() # Auto-rotate dates to prevent overlap
+        
+        # Dark Mode Styling
+        ax.set_facecolor('#2f3136')
+        fig.patch.set_facecolor('#2f3136')
+        ax.tick_params(axis='x', colors='white')
+        ax.tick_params(axis='y', colors='white')
+        ax.grid(color='#40444b', linestyle='--', alpha=0.5)
+        
+        # Remove spines (borders) for cleaner look
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color('white')
+        ax.spines['left'].set_color('white')
+        
+        # Save
         filename = "chart.png"
-        plt.savefig(filename, bbox_inches='tight')
+        plt.savefig(filename, bbox_inches='tight', dpi=100)
         plt.close()
         return filename
     except Exception as e:
@@ -194,10 +219,9 @@ def generate_trend_graph():
 def send_daily_report(client, current_balance):
     print("--- 📊 Generating CEO Report ---")
     
-    # ⚠️ CRITICAL: Uses a Different Webhook for the Report Channel
     webhook = os.getenv("DISCORD_REPORT_WEBHOOK_URL")
     if not webhook: 
-        print("   ⚠️ No Report Webhook found. Using Standard Webhook instead.")
+        print("   ⚠️ No Report Webhook found. Using Standard Webhook.")
         webhook = os.getenv("DISCORD_WEBHOOK_URL")
 
     city_stats = {}
@@ -208,9 +232,20 @@ def send_daily_report(client, current_balance):
     stats_text = ""
     for city in CITIES:
         pnl = city_stats.get(city['name'], 0)
-        emoji = city['emoji']
-        pnl_fmt = f"+${pnl/100:.2f}" if pnl >= 0 else f"-${abs(pnl)/100:.2f}"
-        stats_text += f"{emoji} **{city['name']}:** {pnl_fmt}\n"
+        emoji_city = city['emoji']
+        
+        # COLOR LOGIC (Using Emojis)
+        if pnl > 0:
+            status_dot = "🟢"
+            pnl_fmt = f"+${pnl/100:.2f}"
+        elif pnl < 0:
+            status_dot = "🔴"
+            pnl_fmt = f"-${abs(pnl)/100:.2f}"
+        else:
+            status_dot = "⚪"
+            pnl_fmt = "$0.00"
+            
+        stats_text += f"{status_dot} {emoji_city} **{city['name']}:** {pnl_fmt}\n"
         
     if not stats_text: stats_text = "No trades recorded yet."
 
@@ -219,7 +254,7 @@ def send_daily_report(client, current_balance):
     embed = {
         "title": "📊 Daily CEO Report",
         "description": f"**Account Value:** ${current_balance/100:.2f}\n\n**🌍 City Performance (All-Time):**\n{stats_text}",
-        "color": 3447003, 
+        "color": 3447003, # Blue
         "image": {"url": "attachment://chart.png"},
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -239,7 +274,7 @@ def send_rich_discord_alert(title, color, fields):
     payload = {
         "embeds": [{
             "title": title, "color": color, "fields": fields,
-            "footer": { "text": "Kalshi Bot V26.1" }, "timestamp": datetime.utcnow().isoformat()
+            "footer": { "text": "Kalshi Bot V27" }, "timestamp": datetime.utcnow().isoformat()
         }]
     }
     requests.post(webhook, json=payload)
@@ -375,7 +410,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Force Report V26.1)...")
+    print("🚀 Bot Starting (Visual Final V27)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     current_utc = datetime.utcnow().hour
@@ -387,8 +422,7 @@ def main():
         current_balance = track_portfolio_value(client) 
         if current_balance < MIN_BALANCE_CENTS: return
         
-        # ⚠️ FORCE REPORT RUN (Ignoring Time Check)
-        # This will prove the new code works.
+        # ⚠️ FORCE REPORT for Testing
         send_daily_report(client, current_balance)
 
         check_daytime_profits(client)
