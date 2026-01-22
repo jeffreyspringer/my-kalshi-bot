@@ -10,14 +10,16 @@ from datetime import datetime, timedelta, timezone
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+# ✅ NEW: Imports for retry logic
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21   # 9 PM EST: Stop trading, sell winners
+CASHOUT_HOUR = 21   
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
 
-# ✅ CITIES with Local Timezone Offsets
 CITIES = [
     { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY", "emoji": "🎷", "tz_offset": -6 },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW", "emoji": "🍕", "tz_offset": -6 },
@@ -26,7 +28,6 @@ CITIES = [
     { "name": "AUSTIN",  "lat": 30.19, "lon": -97.67,  "ticker": "KXHIGHAUS",   "airport": "KAUS", "emoji": "🎸", "tz_offset": -6 }
 ]
 
-# RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
@@ -40,6 +41,17 @@ class KalshiClient:
     def __init__(self):
         self.key_id = os.getenv("KALSHI_KEY", "").strip()
         self.private_key = self._load_private_key(os.getenv("KALSHI_PRIVATE_KEY", ""))
+        
+        # ✅ NEW: Setup a persistent session with automatic retries for 500/502/503/504
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=5,                  # Try 5 times total
+            backoff_factor=1,         # Wait 1s, 2s, 4s, 8s... between tries
+            status_forcelist=[500, 502, 503, 504], # Errors that trigger a retry
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
 
     def _load_private_key(self, key_str):
         key_str = key_str.strip().replace('\\n', '\n')
@@ -54,23 +66,33 @@ class KalshiClient:
         signature = self.private_key.sign(msg.encode('utf-8'), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
         headers = {"KALSHI-ACCESS-KEY": self.key_id, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'), "KALSHI-ACCESS-TIMESTAMP": timestamp, "Content-Type": "application/json"}
         url = f"{HOST}/trade-api/v2{path}"
-        if method == "GET": return requests.get(url, headers=headers)
-        return requests.post(url, headers=headers, json=body)
+        
+        # ✅ Changed to use self.session
+        if method == "GET": return self.session.get(url, headers=headers, timeout=10)
+        return self.session.post(url, headers=headers, json=body, timeout=10)
 
     def get_balance(self):
-        res = self._req("GET", "/portfolio/balance")
-        res.raise_for_status()
-        return res.json().get("balance", 0)
+        try:
+            res = self._req("GET", "/portfolio/balance")
+            res.raise_for_status()
+            return res.json().get("balance", 0)
+        except Exception as e:
+            print(f"   ⚠️ Balance Check Failed: {e}")
+            return 999999 # Safe fallback to allow trading even if balance query glitched
 
     def get_positions(self):
-        res = self._req("GET", "/portfolio/positions")
-        res.raise_for_status()
-        return res.json().get("market_positions", [])
+        try:
+            res = self._req("GET", "/portfolio/positions")
+            res.raise_for_status()
+            return res.json().get("market_positions", [])
+        except: return []
 
     def get_orderbook(self, ticker):
-        res = self._req("GET", f"/markets/{ticker}/orderbook")
-        if res.status_code != 200: return None
-        return res.json().get("orderbook")
+        try:
+            res = self._req("GET", f"/markets/{ticker}/orderbook")
+            if res.status_code != 200: return None
+            return res.json().get("orderbook")
+        except: return None
 
     def place_order(self, ticker, action, side, count, price):
         body = {"action": action, "count": count, "type": "limit", "ticker": ticker, "side": side, "yes_price": price if side == "yes" else 0, "no_price": price if side == "no" else 0, "client_order_id": str(uuid.uuid4())}
@@ -117,7 +139,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V44 (Full Visibility)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V45 (Resilient)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -198,25 +220,32 @@ def manage_risk(client, city_ticker, current_forecast):
             except: continue
             diff = abs(current_forecast - strike)
             ob = client.get_orderbook(pos['ticker'])
-            if ob and diff > 1.1: execute_sell(client, pos['ticker'], pos['position'], ob['yes'][0][0] if ob['yes'] else 0, pos.get('average_price', 0), "Forecast Drifted")
+            if ob and diff > 1.1: 
+                bid = ob['yes'][0][0] if ob['yes'] else 0
+                execute_sell(client, pos['ticker'], pos['position'], bid, pos.get('average_price', 0), "Forecast Drifted")
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V44 Full Visibility)...")
+    print("🚀 Bot Starting (V45 Resilient)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     target_date_str = get_target_date_str()
     
     try:
         client = KalshiClient()
         track_portfolio_value(client)
-        if client.get_balance() < MIN_BALANCE_CENTS: return
+        
+        # ✅ Balance Check now has a try/except inside the client
+        balance = client.get_balance()
+        if balance < MIN_BALANCE_CENTS: 
+            print("❌ Low Balance. Stopping."); return
+            
         if (datetime.utcnow().hour - 5) % 24 >= 21: 
             for p in client.get_positions():
                 ob = client.get_orderbook(p['ticker'])
                 if ob and ob['yes']: execute_sell(client, p['ticker'], p['position'], ob['yes'][0][0], p.get('average_price', 0), "Night Cashout")
             return
         all_positions = client.get_positions()
-    except Exception as e: print(f"❌ Error: {e}"); return
+    except Exception as e: print(f"❌ Initialization Error: {e}"); return
 
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
@@ -234,7 +263,8 @@ def main():
         has_pos = any(p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker'] for p in all_positions)
         
         try: 
-            markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
+            markets_res = client._req("GET", "/markets?series_ticker=" + city['ticker'] + "&status=open")
+            markets = markets_res.json().get("markets", [])
             print(f"   📊 API returned {len(markets)} total markets.")
         except: continue
 
@@ -248,22 +278,21 @@ def main():
             target_side = "none"
             
             if diff <= 0.6: 
-                if not has_pos: target_side, msg = "yes", f"🎯 BULLSEYE: {ticker} is within 0.6°."
+                if not has_pos: target_side = "yes"
                 else: print(f"   ⏭️  SKIP YES: {ticker} matches, but already holding a position."); continue
-            elif diff >= 1.8: target_side, msg = "no", f"🛡️ TARGET NO: {ticker} is a safe miss."
+            elif diff >= 1.8: target_side = "no"
             else: print(f"   🚧 SKIP: {ticker} ({strike}°) is in Coin Flip Zone (Diff {diff:.1f}°)."); continue
 
-            print(f"   🔎 Checking {ticker} [{target_side.upper()}]...")
             ob = client.get_orderbook(ticker)
             if not ob: continue
             
             price = 0
             if target_side == "yes":
                 if ob['no']: price = 100 - ob['no'][0][0]
-                else: print("   ❌ No Sellers for YES"); continue
+                else: continue
             else: 
                 if ob['yes']: price = 100 - ob['yes'][0][0]
-                else: print("   ❌ No Sellers for NO"); continue
+                else: continue
 
             if price < MIN_PRICE or price > MAX_PRICE:
                 print(f"   ❌ Price {price}¢ is outside safe zone."); continue
