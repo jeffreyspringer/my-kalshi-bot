@@ -13,11 +13,10 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # --- CONFIGURATION ---
 HOST = "https://api.elections.kalshi.com"
-CASHOUT_HOUR = 21   # 9 PM EST
+CASHOUT_HOUR = 21   
 STATS_FILE = "city_stats.json"
 PORTFOLIO_FILE = "portfolio_history.csv"
 
-# ✅ CITIES
 CITIES = [
     { "name": "NOLA",    "lat": 29.99, "lon": -90.25,  "ticker": "KXHIGHTNOLA", "airport": "KMSY", "emoji": "🎷" },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75,  "ticker": "KXHIGHCHI",   "airport": "KMDW", "emoji": "🍕" },
@@ -26,7 +25,6 @@ CITIES = [
     { "name": "AUSTIN",  "lat": 30.19, "lon": -97.67,  "ticker": "KXHIGHAUS",   "airport": "KAUS", "emoji": "🎸" }
 ]
 
-# RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
@@ -50,24 +48,11 @@ class KalshiClient:
     def _req(self, method, path, body=None):
         timestamp = str(int(time.time() * 1000))
         msg = f"{timestamp}{method}/trade-api/v2{path}"
-        if body:
-            msg += json.dumps(body, separators=(',', ':'))
-
-        signature = self.private_key.sign(
-            msg.encode('utf-8'),
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-            hashes.SHA256()
-        )
-        headers = {
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'),
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
-        }
+        if body: msg += json.dumps(body, separators=(',', ':'))
+        signature = self.private_key.sign(msg.encode('utf-8'), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+        headers = {"KALSHI-ACCESS-KEY": self.key_id, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'), "KALSHI-ACCESS-TIMESTAMP": timestamp, "Content-Type": "application/json"}
         url = f"{HOST}/trade-api/v2{path}"
-        
-        if method == "GET":
-            return requests.get(url, headers=headers)
+        if method == "GET": return requests.get(url, headers=headers)
         return requests.post(url, headers=headers, json=body)
 
     def get_balance(self):
@@ -86,27 +71,15 @@ class KalshiClient:
         return res.json().get("orderbook")
 
     def place_order(self, ticker, action, side, count, price):
-        body = {
-            "action": action,
-            "count": count,
-            "type": "limit",
-            "ticker": ticker,
-            "side": side,
-            "yes_price": price if side == "yes" else 0,
-            "no_price": price if side == "no" else 0,
-            "client_order_id": str(uuid.uuid4())
-        }
+        body = {"action": action, "count": count, "type": "limit", "ticker": ticker, "side": side, "yes_price": price if side == "yes" else 0, "no_price": price if side == "no" else 0, "client_order_id": str(uuid.uuid4())}
         if side == "yes": del body["no_price"]
         else: del body["yes_price"]
-        
         return self._req("POST", "/portfolio/orders", body)
 
-# --- LEDGER SYSTEM ---
+# --- LEDGER ---
 def get_city_meta(ticker):
     for city in CITIES:
-        clean_ticker = city['ticker'].replace("KXHIGHT", "").replace("KXHIGH", "")
-        if clean_ticker in ticker:
-            return city
+        if city['ticker'].replace("KXHIGHT", "").replace("KXHIGH", "") in ticker: return city
     return {"name": "UNKNOWN", "emoji": "❓"}
 
 def update_city_stats(city_name, pnl_cents):
@@ -124,8 +97,7 @@ def log_trade_csv(city_name, ticker, forecast, strike, gap, price, qty, action, 
     file_exists = os.path.isfile("trade_log.csv")
     with open("trade_log.csv", "a", newline="") as f:
         writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["Date", "City", "Action", "Ticker", "Qty", "Price ($)", "PnL ($)", "City Bankroll ($)", "Forecast", "Gap"])
+        if not file_exists: writer.writerow(["Date", "City", "Action", "Ticker", "Qty", "Price ($)", "PnL ($)", "City Bankroll ($)", "Forecast", "Gap"])
         writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), city_name, action, ticker, qty, f"${price/100:.2f}", f"${pnl_cents/100:.2f}" if pnl_cents!=0 else "-", f"${bankroll_cents/100:.2f}", f"{forecast}°", f"{gap:.1f}°"])
 
 def track_portfolio_value(client):
@@ -143,13 +115,35 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V41 (Direct Price)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V42 (Historian)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
     return est_now.strftime("%y%b%d").upper()
 
-# --- FORECASTING ---
+# --- FORECASTING & HISTORY ---
+
+def get_today_high_so_far(airport_code):
+    """Checks actual recorded observations since midnight to catch Midnight Highs"""
+    try:
+        headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
+        url = f"https://api.weather.gov/stations/{airport_code.upper()}/observations"
+        res = requests.get(url, headers=headers).json()
+        
+        today_date = datetime.now(timezone.utc).date()
+        obs_temps = []
+        
+        for obs in res['features']:
+            timestamp = datetime.fromisoformat(obs['properties']['timestamp'].replace('Z', '+00:00'))
+            if timestamp.date() == today_date:
+                temp_c = obs['properties']['temperature']['value']
+                if temp_c is not None:
+                    temp_f = (temp_c * 9/5) + 32
+                    obs_temps.append(temp_f)
+        
+        return max(obs_temps) if obs_temps else 0
+    except: return 0
+
 def get_nws_forecast(lat, lon):
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
@@ -168,14 +162,12 @@ def get_nws_hourly_forecast(lat, lon):
         f_url = p_res['properties']['forecastHourly']
         grid = requests.get(f_url, headers=headers).json()
         periods = grid['properties']['periods']
-        temps = []
-        for i in range(min(18, len(periods))):
-            temps.append(periods[i]['temperature'])
-        if temps: return max(temps)
+        temps = [p['temperature'] for p in periods[:18]]
+        return max(temps) if temps else None
     except: return None
-    return None
 
 # --- TRADING ACTIONS ---
+
 def execute_buy(client, market, qty, price, target_side, distance, safe_forecast):
     city_meta = get_city_meta(market['ticker'])
     try:
@@ -183,18 +175,9 @@ def execute_buy(client, market, qty, price, target_side, distance, safe_forecast
         if resp.status_code == 201:
             current_bankroll = update_city_stats(city_meta['name'], 0)
             log_trade_csv(city_meta['name'], market['ticker'], safe_forecast, 0, distance, price, qty, f"BUY {target_side.upper()}", 0, current_bankroll)
-            fields = [
-                {"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True},
-                {"name": "Contract", "value": f"`{market['ticker']}`", "inline": True},
-                {"name": "Order", "value": f"Buy **{qty}x {target_side.upper()}** @ {price}¢", "inline": False},
-                {"name": "Stats", "value": f"Forecast {safe_forecast:.1f}° (Dist {distance:.1f}°)", "inline": False},
-                {"name": "City Bankroll", "value": f"${current_bankroll/100:.2f}", "inline": True}
-            ]
+            fields = [{"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True}, {"name": "Contract", "value": f"`{market['ticker']}`", "inline": True}, {"name": "Order", "value": f"Buy **{qty}x {target_side.upper()}** @ {price}¢", "inline": False}, {"name": "Stats", "value": f"Forecast {safe_forecast:.1f}° (Dist {distance:.1f}°)", "inline": False}, {"name": "City Bankroll", "value": f"${current_bankroll/100:.2f}", "inline": True}]
             send_rich_discord_alert("🚀 BUY ORDER EXECUTED", 3447003, fields)
-            print(f"   ✅ SUCCESS: Bought {qty}x {market['ticker']}")
-        else:
-            print(f"   ❌ FAILED: {resp.text}")
-    except Exception as e: print(f"Buy Error: {e}")
+    except: pass
 
 def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
     city_meta = get_city_meta(ticker)
@@ -204,45 +187,8 @@ def execute_sell(client, ticker, qty, sell_price, entry_price, reason):
         if resp.status_code == 201:
             new_total = update_city_stats(city_meta['name'], gross_pnl_cents)
             log_trade_csv(city_meta['name'], ticker, "N/A", 0, 0, sell_price, qty, "SELL", gross_pnl_cents, new_total)
-            color = 5763719 if gross_pnl_cents >= 0 else 15548997
-            fields = [
-                {"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True},
-                {"name": "Reason", "value": reason, "inline": True},
-                {"name": "Result", "value": f"Sold {qty}x @ {sell_price}¢ (Entry: {entry_price}¢)", "inline": False},
-                {"name": "PnL", "value": f"**${gross_pnl_cents/100:.2f}**", "inline": True},
-                {"name": "Bankroll", "value": f"${new_total/100:.2f}", "inline": True}
-            ]
-            send_rich_discord_alert(f"🤑 POSITION CLOSED", color, fields)
-            print(f"   ✅ SOLD {ticker}")
-    except Exception as e: print(f"Sell Error: {e}")
-
-def check_daytime_profits(client):
-    print("--- 💰 Checking for Jackpots ---")
-    try:
-        positions = client.get_positions()
-        for pos in positions:
-            if pos['position'] <= 0: continue
-            ob = client.get_orderbook(pos['ticker'])
-            if not ob: continue
-            # Check YES bid to see if it's worth selling
-            best_bid = ob['yes'][0][0] if ob['yes'] else 0
-            if best_bid >= PROFIT_TAKE_PRICE:
-                entry_price = pos.get('average_price', 0)
-                execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "JACKPOT")
-    except: pass
-
-def liquidate_winners(client):
-    print(f"--- 🌙 Night Shift ---")
-    try:
-        positions = client.get_positions()
-        for pos in positions:
-            if pos['position'] <= 0: continue
-            ob = client.get_orderbook(pos['ticker'])
-            if not ob: continue
-            best_bid = ob['yes'][0][0] if ob['yes'] else 0
-            entry_price = pos.get('average_price', 0)
-            if best_bid > entry_price and best_bid > 5:
-                execute_sell(client, pos['ticker'], pos['position'], best_bid, entry_price, "NIGHT CASHOUT")
+            fields = [{"name": "City", "value": f"{city_meta['emoji']} {city_meta['name']}", "inline": True}, {"name": "Reason", "value": reason, "inline": True}, {"name": "Result", "value": f"Sold {qty}x @ {sell_price}¢", "inline": False}, {"name": "PnL", "value": f"**${gross_pnl_cents/100:.2f}**", "inline": True}]
+            send_rich_discord_alert(f"🤑 POSITION CLOSED", 5763719, fields)
     except: pass
 
 def manage_risk(client, city_ticker, current_forecast):
@@ -253,140 +199,92 @@ def manage_risk(client, city_ticker, current_forecast):
             if pos['position'] <= 0: continue
             try: strike = float(re.findall(r"(\d+(?:\.\d+)?)", pos['ticker'])[-1])
             except: continue
-            
             diff = abs(current_forecast - strike)
             ob = client.get_orderbook(pos['ticker'])
             if not ob: continue
             current_bid = ob['yes'][0][0] if ob['yes'] else 0
-            entry_price = pos.get('average_price', 0)
-            
-            should_sell = False
-            reason = ""
-            
-            if diff > 1.0:
-                is_profitable = current_bid > entry_price
-                if is_profitable: should_sell = True; reason = "PROFIT PROTECT (Drifted)"
-                else: should_sell = True; reason = "STOP LOSS (Drifted)"
-                    
-            if should_sell: execute_sell(client, pos['ticker'], pos['position'], current_bid, entry_price, reason)
+            if diff > 1.0: execute_sell(client, pos['ticker'], pos['position'], current_bid, pos.get('average_price', 0), "Drifted Outside Range")
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V41 Direct Price)...")
+    print("🚀 Bot Starting (V42 Historian)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
-    print(f"🕒 Time: {current_est}:00 EST | 🔒 Date: {target_date_str}")
     
     try:
         client = KalshiClient()
         track_portfolio_value(client)
-        if client.get_balance() < MIN_BALANCE_CENTS: 
-            print("❌ Low Balance"); return
+        if client.get_balance() < MIN_BALANCE_CENTS: return
         
-        check_daytime_profits(client)
-        if current_est >= CASHOUT_HOUR:
-            liquidate_winners(client); return
+        if current_est >= 21: # 9 PM EST
+            liquidate_winners = client.get_positions()
+            for p in liquidate_winners:
+                ob = client.get_orderbook(p['ticker'])
+                if ob and ob['yes']: execute_sell(client, p['ticker'], p['position'], ob['yes'][0][0], p.get('average_price', 0), "Night Cashout")
+            return
         
         all_positions = client.get_positions()
+    except Exception as e: print(f"❌ Error: {e}"); return
 
-    except Exception as e: print(f"❌ Login Error: {e}"); return
-
-    print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
+        # 1. Get Forward Forecasts
         nws = get_nws_forecast(city['lat'], city['lon'])
-        hourly_max = get_nws_hourly_forecast(city['lat'], city['lon'])
+        hourly = get_nws_hourly_forecast(city['lat'], city['lon'])
         
-        nws_str = f"{nws}°" if nws else "N/A"
-        hourly_str = f"{hourly_max}°" if hourly_max else "N/A"
+        # 2. Get Historical High Today (CRITICAL)
+        high_so_far = get_today_high_so_far(city['airport'])
         
-        if not nws and not hourly_max: 
-            print("   ⚠️ No Weather Data"); continue
+        if not nws and not hourly: continue
         
-        if nws and hourly_max: safe_forecast = (nws + hourly_max) / 2
-        else: safe_forecast = nws or hourly_max
+        # Calculate expected high for the remainder of the day
+        future_high = (nws + hourly) / 2 if (nws and hourly) else (nws or hourly)
         
-        print(f"   🎯 Forecast: {safe_forecast:.1f}° (Daily: {nws_str} | Hourly: {hourly_str})")
+        # ✅ REAL HIGH = The greater of (What we expect) vs (What already happened)
+        safe_forecast = max(future_high, high_so_far)
+        
+        print(f"   🎯 Logic: Future Forecast {future_high:.1f}° | Already Hit {high_so_far:.1f}°")
+        print(f"   ✅ Final Target High: {safe_forecast:.1f}°")
         
         manage_risk(client, city['ticker'], safe_forecast)
         
-        has_active_position = False
-        for p in all_positions:
-            if p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker']:
-                has_active_position = True
-                print(f"   🔒 Active position found: {p['ticker']}.")
-                break
+        has_pos = any(p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker'] for p in all_positions)
         
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
-        except: print("   ⚠️ API Error fetching markets"); continue
-        
-        if not markets: continue
+        except: continue
 
         for market in markets:
             ticker = market['ticker']
             if target_date_str not in ticker: continue
-            
-            try:
-                matches = re.findall(r"(\d+(?:\.\d+)?)", ticker)
-                if not matches: continue
-                strike = float(matches[-1]) 
+            try: strike = float(re.findall(r"(\d+(?:\.\d+)?)", ticker)[-1])
             except: continue
             
             diff = abs(safe_forecast - strike)
             target_side = "none"
             
             if diff <= 0.6: 
-                if has_active_position:
-                    print(f"   Skipping {strike}° [YES]: Already hold a position.")
-                    continue
-                target_side = "yes"
-            elif diff >= 1.8:
-                target_side = "no"
-            else:
-                print(f"   Skipping {strike}°: Coin Flip Zone (Diff {diff:.1f})")
-                continue
+                if not has_pos: target_side = "yes"
+            elif diff >= 1.8: target_side = "no"
+            else: continue
 
             ob = client.get_orderbook(ticker)
             if not ob: continue
             
-            # ✅ DIRECT ORDERBOOK ACCESS
-            # Instead of 100 - NO Bid, we look for the actual Sellers (Asks)
-            # yes_ask: Price to buy YES. no_ask: Price to buy NO.
-            yes_ask = ob['no'][0][0] if ob['no'] else 0 # Best Seller for YES is inverse of No bidder? No.
-            # Correction: Kalshi API orderbook 'yes' contains bidders. 'no' contains bidders for NO.
-            # Best price to buy YES = (100 - best_bid_for_NO). 
-            # If NO bidders are missing, we check the 'yes' side for sellers.
-            
             price = 0
             if target_side == "yes":
-                # Find the lowest price someone is willing to sell YES for
-                # If there are NO bidders (ob['no']), we can buy at (100 - no_bid)
-                no_bid = ob['no'][0][0] if ob['no'] else 0
-                if no_bid > 0:
-                    price = 100 - no_bid
-                else:
-                    print(f"   Skipping {strike}° [YES]: No Sellers (Empty Book)")
-                    continue
+                if ob['no']: price = 100 - ob['no'][0][0]
+                else: continue
             else: 
-                # Find the lowest price someone is willing to sell NO for
-                yes_bid = ob['yes'][0][0] if ob['yes'] else 0
-                if yes_bid > 0:
-                    price = 100 - yes_bid
-                else:
-                    print(f"   Skipping {strike}° [NO]: No Sellers (Empty Book)")
-                    continue
+                if ob['yes']: price = 100 - ob['yes'][0][0]
+                else: continue
 
-            if price < MIN_PRICE or price > MAX_PRICE:
-                print(f"   Skipping {strike}° [{target_side.upper()}]: Price {price}¢ is bad.")
-                continue
-
+            if price < MIN_PRICE or price > MAX_PRICE: continue
             qty = LOW_CONF_COUNT
             if diff < 0.3: qty = MED_CONF_COUNT 
             if diff > 3.0: qty = HIGH_CONF_COUNT 
             
-            print(f"   🚀 EXECUTE: Buying {qty}x {ticker} [{target_side}] @ {price}¢ (Diff {diff:.1f})")
+            print(f"   🚀 Buying {qty}x {ticker} [{target_side}] @ {price}¢")
             execute_buy(client, market, qty, price, target_side, diff, safe_forecast)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
