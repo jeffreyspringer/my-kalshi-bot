@@ -25,7 +25,7 @@ CITIES = [
 # RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
-PROFIT_TAKE_PRICE = 92      # Sell automatically if bid is this high
+PROFIT_TAKE_PRICE = 92      
 FEE_BUFFER = 3
 MIN_PRICE = 20
 MAX_PRICE = 80
@@ -114,7 +114,6 @@ def log_trade(ticker, forecast, strike, gap, price, qty, action):
 # --- FORECASTING ENGINES ---
 
 def get_nws_forecast(lat, lon):
-    """Fetches the official NWS Day High."""
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
@@ -128,10 +127,12 @@ def get_nws_forecast(lat, lon):
     return None
 
 def get_lamp_forecast(airport_code):
-    """Fetches GFS LAMP data with robust parsing."""
+    """Fetches GFS LAMP data. FIXED: Uses lowercase for URL."""
     try:
-        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code}.txt"
+        # ⚠️ CRITICAL FIX: .lower() ensures we hit 'kmsy.txt' instead of 'KMSY.txt'
+        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt"
         res = requests.get(url)
+        
         if res.status_code != 200: 
             print(f"   ⚠️ LAMP Failed: {airport_code} not found (404).")
             return None
@@ -139,7 +140,6 @@ def get_lamp_forecast(airport_code):
         lines = res.text.split('\n')
         utc_line, tmp_line = None, None
         
-        # Robust Parsing: Strip spaces to find row headers
         for line in lines:
             clean = line.strip()
             if clean.startswith("UTC"): utc_line = clean
@@ -148,10 +148,7 @@ def get_lamp_forecast(airport_code):
         if not utc_line or not tmp_line: 
             return None
         
-        # Extract numbers (split() handles variable spacing)
         temps = [int(x) for x in tmp_line.split()[1:]]
-        
-        # Grab max of the next 15 hours
         valid_temps = temps[:15]
         return max(valid_temps)
         
@@ -180,7 +177,7 @@ def check_profits(client):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (Dual-Engine Mode)...")
+    print("🚀 Bot Starting (Dual-Engine V14)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -197,13 +194,11 @@ def main():
     for city in CITIES:
         print(f"\n🔎 {city['name']} ({city['airport']})...")
         
-        # 1. Get Engines
         nws = get_nws_forecast(city['lat'], city['lon'])
         lamp = get_lamp_forecast(city['airport'])
         
         print(f"   Forecasts: NWS {nws}° | LAMP {lamp}°")
         
-        # 2. Consensus Logic
         if nws and lamp:
             safe_forecast = (nws + lamp) / 2
         elif nws:
@@ -234,11 +229,10 @@ def main():
 
             gap = safe_forecast - strike
             
-            # --- VERBOSE LOGGING START ---
+            # VERBOSE LOGGING
             if gap < 2.0: 
                 print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small.")
                 continue 
-            # -----------------------------
             
             qty = LOW_CONF_COUNT
             if gap >= 5.0: qty = HIGH_CONF_COUNT
