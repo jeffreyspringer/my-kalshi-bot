@@ -14,24 +14,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          
       - run: pip install -r requirements.txt
-      
+       
       - name: Run Bot
         env:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }} # <--- ADDED THIS
           TRADING_ENABLED: ${{ vars.TRADING_ENABLED }} 
         run: python -u bot.py
 
-      - name: Commit Trade Log
+      - name: Commit Data & Logs
         run: |
           git config --global user.name "KalshiBot"
           git config --global user.email "bot@kalshi.com"
-          if [ -f trade_log.csv ]; then
-            git add trade_log.csv
-            git diff --quiet && git diff --staged --quiet || (git commit -m "Update trade log" && git push)
-          fi
+          
+          # Add all the memory files so the bot remembers stats next time
+          git add trade_log.csv city_stats.json portfolio_history.csv last_report_date.txt
+          
+          # Only commit if something changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update logs and stats" && git push)
