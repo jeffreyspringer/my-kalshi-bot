@@ -144,7 +144,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V38 (API Fix)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V40 (Highlander)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -163,28 +163,17 @@ def get_nws_forecast(lat, lon):
     return None
 
 def get_nws_hourly_forecast(lat, lon):
-    """Fetches the max temp from the next 18 hours of hourly forecast"""
     try:
         headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
-        # 1. Get the gridpoints (if we don't have them cached)
         p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
         f_url = p_res['properties']['forecastHourly']
-        
-        # 2. Get the hourly data
         grid = requests.get(f_url, headers=headers).json()
         periods = grid['properties']['periods']
-        
-        # 3. Look ahead 18 hours (enough to cover the rest of the day)
         temps = []
         for i in range(min(18, len(periods))):
             temps.append(periods[i]['temperature'])
-            
-        if temps:
-            return max(temps)
-            
-    except Exception as e:
-        print(f"   [NWS HOURLY ERROR] {e}")
-        return None
+        if temps: return max(temps)
+    except: return None
     return None
 
 # --- TRADING ACTIONS ---
@@ -265,7 +254,7 @@ def manage_risk(client, city_ticker, current_forecast):
             try: strike = float(re.findall(r"(\d+(?:\.\d+)?)", pos['ticker'])[-1])
             except: continue
             
-            distance = abs(current_forecast - strike)
+            diff = abs(current_forecast - strike)
             ob = client.get_orderbook(pos['ticker'])
             if not ob or not ob['yes']: continue
             current_bid = ob['yes'][0][0]
@@ -273,18 +262,18 @@ def manage_risk(client, city_ticker, current_forecast):
             
             should_sell = False
             reason = ""
-            if distance > 2.0:
+            
+            # If we own it, but forecast drifted > 1.0 away, SELL
+            if diff > 1.0:
                 is_profitable = current_bid > entry_price
-                is_market_confident = current_bid > 50
-                if is_profitable:
-                    should_sell = True; reason = "PROFIT PROTECT"
-                elif not is_market_confident:
-                    should_sell = True; reason = "STOP LOSS"
+                if is_profitable: should_sell = True; reason = "PROFIT PROTECT (Drifted)"
+                else: should_sell = True; reason = "STOP LOSS (Drifted)"
+                    
             if should_sell: execute_sell(client, pos['ticker'], pos['position'], current_bid, entry_price, reason)
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V38 API Fix)...")
+    print("🚀 Bot Starting (V40 Highlander)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -299,14 +288,17 @@ def main():
         check_daytime_profits(client)
         if current_est >= CASHOUT_HOUR:
             liquidate_winners(client); return
-            
+        
+        # 🔍 NEW: Get all active positions for the current date
+        # This allows us to check if we already have a bet in play
+        all_positions = client.get_positions()
+
     except Exception as e: print(f"❌ Login Error: {e}"); return
 
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
         nws = get_nws_forecast(city['lat'], city['lon'])
-        # 👇 NEW: Uses reliable API instead of broken text server
         hourly_max = get_nws_hourly_forecast(city['lat'], city['lon'])
         
         nws_str = f"{nws}°" if nws else "N/A"
@@ -315,13 +307,22 @@ def main():
         if not nws and not hourly_max: 
             print("   ⚠️ No Weather Data"); continue
         
-        # Smart average: if one is missing, use the other
         if nws and hourly_max: safe_forecast = (nws + hourly_max) / 2
         else: safe_forecast = nws or hourly_max
         
-        print(f"   🎯 Forecast: {safe_forecast:.1f}° (Daily: {nws_str} | Hourly Max: {hourly_str})")
+        print(f"   🎯 Forecast: {safe_forecast:.1f}° (Daily: {nws_str} | Hourly: {hourly_str})")
         
+        # 1. Manage Risk (Sell old bad bets)
         manage_risk(client, city['ticker'], safe_forecast)
+        
+        # 2. Check for Active Positions (Post-Risk Management)
+        # If we still hold a position for this city/date, DO NOT BUY ANOTHER YES.
+        has_active_position = False
+        for p in all_positions:
+            if p['position'] > 0 and city['ticker'] in p['ticker'] and target_date_str in p['ticker']:
+                has_active_position = True
+                print(f"   🔒 Active position found: {p['ticker']}. Skipping new YES buys.")
+                break
         
         try: markets = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open").json().get("markets", [])
         except: print("   ⚠️ API Error fetching markets"); continue
@@ -337,22 +338,29 @@ def main():
             try:
                 matches = re.findall(r"(\d+(?:\.\d+)?)", ticker)
                 if not matches: continue
-                strike = float(matches[-1])
+                strike = float(matches[-1]) 
             except: continue
             
-            delta = safe_forecast - strike
-            
+            diff = abs(safe_forecast - strike)
             target_side = "none"
-            if delta > SAFETY_BUFFER: target_side = "yes"
-            elif delta < -SAFETY_BUFFER: target_side = "no"
+            
+            # 1. Bullseye (YES)
+            if diff <= 0.6: 
+                # 🛑 HIGHLANDER CHECK: Only 1 YES allowed
+                if has_active_position:
+                    print(f"   Skipping {strike}° [YES]: Already hold a position.")
+                    continue
+                target_side = "yes"
+            
+            # 2. Safe Miss (NO) - We allow NO bets even if we have a YES (hedging)
+            elif diff >= 1.8:
+                target_side = "no"
             else:
-                print(f"   Skipping {strike}° ({ticker}): Too Close (Delta {delta:.1f})")
+                print(f"   Skipping {strike}°: In 'Coin Flip' Zone (Diff {diff:.1f})")
                 continue
 
             ob = client.get_orderbook(ticker)
-            if not ob: 
-                print(f"   Skipping {strike}°: Orderbook Empty")
-                continue
+            if not ob: continue
             
             yes_bid = ob['yes'][0][0] if ob['yes'] else 0
             no_bid = ob['no'][0][0] if ob['no'] else 0
@@ -374,10 +382,11 @@ def main():
                 continue
 
             qty = LOW_CONF_COUNT
-            if abs(delta) > 4.0: qty = MED_CONF_COUNT 
+            if diff < 0.3: qty = MED_CONF_COUNT 
+            if diff > 3.0: qty = HIGH_CONF_COUNT 
             
-            print(f"   🚀 EXECUTE: Buying {qty}x {ticker} [{target_side}] @ {price}¢ (Delta {delta:.1f})")
-            execute_buy(client, market, qty, price, target_side, abs(delta), safe_forecast)
+            print(f"   🚀 EXECUTE: Buying {qty}x {ticker} [{target_side}] @ {price}¢ (Diff {diff:.1f})")
+            execute_buy(client, market, qty, price, target_side, diff, safe_forecast)
 
 if __name__ == "__main__":
     main()
