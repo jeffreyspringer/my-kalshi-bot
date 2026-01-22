@@ -2,46 +2,32 @@ name: Daily PnL Report
 
 on:
   schedule:
-    # Runs at 04:55 UTC (approx 10:55 PM Central / 11:55 PM Eastern)
-    - cron: '55 4 * * *'
-  workflow_dispatch: # Allows manual trigger
-
-permissions:
-  contents: write  # Required to save balance_history.json
+    # Runs at 1 AM EST (which is 06:00 UTC)
+    - cron: '0 6 * * *'
+  workflow_dispatch:  # Allows manual button press
 
 jobs:
   report:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.9'
 
       - name: Install Dependencies
         run: |
-          pip install -r requirements.txt
+          pip install requests cryptography matplotlib
 
-      - name: Run Tracker
+      - name: Run CEO Report
         env:
           KALSHI_KEY: ${{ secrets.KALSHI_KEY }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-          # The new secret for your PnL channel
-          DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }}
-          # Fallback to the main channel if the report one fails
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python tracker.py
-
-      - name: Commit and Save History
-        run: |
-          git config --global user.name "KalshiBot"
-          git config --global user.email "bot@kalshi.com"
-          
-          # Only commit if the tracker actually updated the file
-          if [ -f balance_history.json ]; then
-            git add balance_history.json
-            git diff --quiet && git diff --staged --quiet || (git commit -m "Update daily balance history" && git push)
-          fi
+          DISCORD_REPORT_WEBHOOK_URL: ${{ secrets.DISCORD_REPORT_WEBHOOK_URL }}
+          TRADING_ENABLED: "TRUE"
+        run: python bot.py
