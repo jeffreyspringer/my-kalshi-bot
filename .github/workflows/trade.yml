@@ -34,8 +34,9 @@ jobs:
           git config --global user.name "KalshiBot"
           git config --global user.email "bot@kalshi.com"
           
-          # Add all the memory files so the bot remembers stats next time
-          git add trade_log.csv city_stats.json portfolio_history.csv last_report_date.txt
+          # "git add ." stages ALL new or modified files automatically
+          # This prevents the error if trade_log.csv doesn't exist yet
+          git add .
           
-          # Only commit if something changed
+          # Only commit if there are actually changes to save
           git diff --quiet && git diff --staged --quiet || (git commit -m "Update logs and stats" && git push)
