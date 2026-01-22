@@ -1,5 +1,5 @@
 import os
-import re # Added for robust number parsing
+import re 
 import uuid
 import requests
 import csv
@@ -143,7 +143,7 @@ def track_portfolio_value(client):
 def send_rich_discord_alert(title, color, fields):
     webhook = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook: return
-    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V35 (Forensic)"}, "timestamp": datetime.utcnow().isoformat()}]})
+    requests.post(webhook, json={"embeds": [{"title": title, "color": color, "fields": fields, "footer": {"text": "Kalshi Bot V36 (LAMP Fix)"}, "timestamp": datetime.utcnow().isoformat()}]})
 
 def get_target_date_str():
     est_now = datetime.now(timezone.utc) - timedelta(hours=5)
@@ -163,8 +163,15 @@ def get_nws_forecast(lat, lon):
 
 def get_lamp_forecast(airport_code):
     try:
-        res = requests.get(f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt")
-        if res.status_code != 200: return None
+        # ✅ FIX: Sending User-Agent to avoid 403 Forbidden error
+        headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
+        url = f"https://tgftp.nws.noaa.gov/data/forecasts/lamp/station/{airport_code.lower()}.txt"
+        res = requests.get(url, headers=headers)
+        
+        if res.status_code != 200: 
+            print(f"   [LAMP ERROR] {airport_code} Status: {res.status_code}")
+            return None
+            
         tmp_line = None
         for line in res.text.split('\n'):
             if "TMP" in line and len(line) > 20: 
@@ -173,7 +180,9 @@ def get_lamp_forecast(airport_code):
         if not tmp_line: return None
         temps = [int(s) for s in tmp_line.split() if s.isdigit()]
         return max(temps[:15]) if temps else None
-    except: return None
+    except Exception as e:
+        print(f"   [LAMP ERROR] {e}")
+        return None
 
 # --- TRADING ACTIONS ---
 def execute_buy(client, market, qty, price, target_side, distance, safe_forecast):
@@ -273,7 +282,7 @@ def manage_risk(client, city_ticker, current_forecast):
     except: pass
 
 def main():
-    print("🚀 Bot Starting (V35 Forensic Auditor)...")
+    print("🚀 Bot Starting (V36 LAMP Fix)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     current_est = (datetime.utcnow().hour - 5) % 24
     target_date_str = get_target_date_str()
@@ -316,27 +325,16 @@ def main():
 
         for market in markets:
             ticker = market['ticker']
+            if target_date_str not in ticker: continue
             
-            # 1. Date Check
-            if target_date_str not in ticker:
-                # print(f"   [SKIP] {ticker} (Wrong Date)")
-                continue
-            
-            # 2. Robust Strike Parsing (The key fix!)
             try:
-                # Finds the last number in the string (e.g. T76 -> 76, T78.5 -> 78.5)
                 matches = re.findall(r"(\d+(?:\.\d+)?)", ticker)
-                if not matches:
-                    print(f"   [ERROR] Could not parse strike from: {ticker}")
-                    continue
+                if not matches: continue
                 strike = float(matches[-1])
-            except Exception as e:
-                print(f"   [ERROR] Crash parsing {ticker}: {e}")
-                continue
+            except: continue
             
             delta = safe_forecast - strike
             
-            # 3. Direction Logic
             target_side = "none"
             if delta > 1.5: target_side = "yes"
             elif delta < -1.5: target_side = "no"
@@ -349,19 +347,18 @@ def main():
                 print(f"   Skipping {strike}°: Orderbook Empty")
                 continue
             
-            # 4. Pricing & Liquidity Logic
             yes_bid = ob['yes'][0][0] if ob['yes'] else 0
             no_bid = ob['no'][0][0] if ob['no'] else 0
             
             price = 0
             if target_side == "yes":
                 if no_bid == 0: 
-                    print(f"   Skipping {strike}° [YES]: No Liquidity (No Bids to Buy against)")
+                    print(f"   Skipping {strike}° [YES]: No Liquidity")
                     continue
                 price = 100 - no_bid 
             else: 
                 if yes_bid == 0: 
-                    print(f"   Skipping {strike}° [NO]: No Liquidity (Yes Bids to Buy against)")
+                    print(f"   Skipping {strike}° [NO]: No Liquidity")
                     continue
                 price = 100 - yes_bid 
 
