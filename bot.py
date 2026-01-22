@@ -2,11 +2,16 @@ import os
 import uuid
 import requests
 import csv
+import time
+import json
+import base64
 from datetime import datetime
-import kalshi_python
-from kalshi_python.models import *
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-# --- CONFIGURATION: CITY LIST ---
+# --- CONFIGURATION ---
+HOST = "https://api.elections.kalshi.com"
 CITIES = [
     { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },
     { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHTCHI" },
@@ -15,225 +20,207 @@ CITIES = [
     { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHTAUS" }
 ]
 
-# RISK & STRATEGY
+# RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
 PROFIT_TAKE_PRICE = 92      
 FEE_BUFFER = 3
 MIN_PRICE = 20
 MAX_PRICE = 80
-
-# CONFIDENCE SCALING
 LOW_CONF_COUNT = 1
 MED_CONF_COUNT = 3
 HIGH_CONF_COUNT = 10
 
+class KalshiClient:
+    def __init__(self):
+        self.key_id = os.getenv("KALSHI_KEY", "").strip()
+        self.private_key = self._load_private_key(os.getenv("KALSHI_PRIVATE_KEY", ""))
+
+    def _load_private_key(self, key_str):
+        key_str = key_str.strip().replace('\\n', '\n')
+        if "-----BEGIN" not in key_str:
+            key_str = f"-----BEGIN RSA PRIVATE KEY-----\n{key_str}\n-----END RSA PRIVATE KEY-----"
+        return load_pem_private_key(key_str.encode(), password=None)
+
+    def _req(self, method, path, body=None):
+        timestamp = str(int(time.time() * 1000))
+        msg = f"{timestamp}{method}/trade-api/v2{path}"
+        if body:
+            msg += json.dumps(body, separators=(',', ':')) # Minify JSON for signing
+
+        signature = self.private_key.sign(
+            msg.encode('utf-8'),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+        headers = {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode('utf-8'),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "Content-Type": "application/json"
+        }
+        url = f"{HOST}/trade-api/v2{path}"
+        
+        if method == "GET":
+            return requests.get(url, headers=headers)
+        return requests.post(url, headers=headers, json=body)
+
+    def get_balance(self):
+        res = self._req("GET", "/portfolio/balance")
+        res.raise_for_status()
+        return res.json().get("balance", 0)
+
+    def get_positions(self):
+        res = self._req("GET", "/portfolio/positions")
+        res.raise_for_status()
+        return res.json().get("market_positions", [])
+
+    def get_market(self, ticker):
+        res = self._req("GET", f"/markets/{ticker}")
+        if res.status_code != 200: return None
+        return res.json().get("market")
+
+    def get_orderbook(self, ticker):
+        res = self._req("GET", f"/markets/{ticker}/orderbook")
+        if res.status_code != 200: return None
+        return res.json().get("orderbook")
+
+    def place_order(self, ticker, action, side, count, price):
+        body = {
+            "action": action,
+            "count": count,
+            "type": "limit",
+            "ticker": ticker,
+            "side": side,
+            "yes_price": price if side == "yes" else 0,
+            "no_price": price if side == "no" else 0,
+            "client_order_id": str(uuid.uuid4())
+        }
+        # Clean up price (API requires only one price set)
+        if side == "yes": del body["no_price"]
+        else: del body["yes_price"]
+        
+        return self._req("POST", "/portfolio/orders", body)
+
+# --- UTILS ---
 def send_discord_alert(message):
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook_url: return
-    try:
-        requests.post(webhook_url, json={"content": message})
-    except Exception as e:
-        print(f"Discord Error: {e}")
+    webhook = os.getenv("DISCORD_WEBHOOK_URL")
+    if webhook: requests.post(webhook, json={"content": message})
 
 def log_trade(ticker, forecast, strike, gap, price, qty, action):
     file_exists = os.path.isfile("trade_log.csv")
-    try:
-        with open("trade_log.csv", "a", newline="") as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-                ticker, forecast, strike, f"{gap:.1f}", price, qty, action
-            ])
-    except Exception as e:
-        print(f"CSV Log Error: {e}")
+    with open("trade_log.csv", "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["Date", "Ticker", "Forecast", "Strike", "Gap", "Price", "Qty", "Action"])
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), ticker, forecast, strike, f"{gap:.1f}", price, qty, action])
 
-def get_open_meteo_forecast(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
+def get_forecasts(lat, lon):
+    # OM
+    om_temp = None
     try:
-        res = requests.get(url).json()
-        return res['daily']['temperature_2m_max'][0]
-    except Exception as e:
-        print(f"⚠️ OpenMeteo Error: {e}")
-        return None
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&temperature_unit=fahrenheit&timezone=auto"
+        om_temp = requests.get(url).json()['daily']['temperature_2m_max'][0]
+    except: pass
 
-def get_nws_forecast(lat, lon):
-    headers = {'User-Agent': '(KalshiWeatherBot, contact@example.com)'}
+    # NWS
+    nws_temp = None
     try:
-        point_url = f"https://api.weather.gov/points/{lat},{lon}"
-        point_res = requests.get(point_url, headers=headers).json()
-        if 'status' in point_res and point_res['status'] >= 400:
-            return None
-        forecast_url = point_res['properties']['forecast']
-        grid_res = requests.get(forecast_url, headers=headers).json()
-        periods = grid_res['properties']['periods']
-        for p in periods:
+        headers = {'User-Agent': '(KalshiBot, contact@example.com)'}
+        p_res = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers).json()
+        f_url = p_res['properties']['forecast']
+        grid = requests.get(f_url, headers=headers).json()
+        for p in grid['properties']['periods']:
             if p['isDaytime']:
-                return p['temperature']
-        return None
-    except Exception as e:
-        print(f"⚠️ NWS Error: {e}")
-        return None
-
-def check_for_profit_taking(portfolio_api, market_api):
-    print("--- Checking Profit Taking ---")
-    try:
-        positions = portfolio_api.get_positions().market_positions
-        for pos in positions:
-            if pos.position > 0:
-                orderbook = market_api.get_market_orderbook(pos.ticker)
-                if not orderbook.orderbook.yes: continue
-                best_bid = orderbook.orderbook.yes[0][0]
-                if best_bid >= PROFIT_TAKE_PRICE:
-                    print(f"💰 SELLING {pos.ticker} @ {best_bid}¢")
-                    portfolio_api.create_order(CreateOrderRequest(
-                        ticker=pos.ticker, action="sell", side="yes",
-                        count=pos.position, type="limit", yes_price=best_bid,
-                        client_order_id=str(uuid.uuid4())
-                    ))
-                    log_trade(pos.ticker, "N/A", "N/A", 0, best_bid, pos.position, "SELL_PROFIT")
-                    send_discord_alert(f"💰 **Profit Taken!** Sold {pos.position}x {pos.ticker} at **{best_bid}¢**")
-    except Exception as e:
-        print(f"Profit Taking Skip: {e}")
+                nws_temp = p['temperature']
+                break
+    except: pass
+    
+    return om_temp, nws_temp
 
 def main():
-    print("🚀 Bot Starting...")
-
-    # 1. Credentials with AGGRESSIVE STRIPPING
-    api_key_id = os.getenv("KALSHI_KEY", "").strip()
-    private_key_pem = os.getenv("KALSHI_PRIVATE_KEY", "").strip()
-
-    if not api_key_id or not private_key_pem: 
-        print("❌ CRITICAL: Missing API Keys in Secrets!")
-        return
-
-    # --- 🛠️ KEY REPAIR STATION (VERSION 5.1) 🛠️ ---
-    # 1. Clean up "escaped" newlines from GitHub secrets
-    if "\\n" in private_key_pem:
-        print("🔧 Repairing: Converting escaped newlines to real newlines...")
-        private_key_pem = private_key_pem.replace('\\n', '\n')
-
-    # 2. Add Headers if missing (Rare but possible)
-    if "-----BEGIN RSA PRIVATE KEY-----" not in private_key_pem:
-        print("🔧 Repairing: Adding missing BEGIN Header...")
-        private_key_pem = "-----BEGIN RSA PRIVATE KEY-----\n" + private_key_pem
+    print("🚀 Bot Starting (Raw Mode)...")
+    if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
-    if "-----END RSA PRIVATE KEY-----" not in private_key_pem:
-        print("🔧 Repairing: Adding missing END Header...")
-        private_key_pem = private_key_pem + "\n-----END RSA PRIVATE KEY-----"
-
-    # --- 🩺 KEY DOCTOR DIAGNOSIS (SAFE TO VIEW) 🩺 ---
-    print(f"📋 KEY ID CHECK: Length={len(api_key_id)} | First 4='{api_key_id[:4]}...' | Last 4='...{api_key_id[-4:]}'")
-    
-    key_lines = private_key_pem.split('\n')
-    print(f"📋 PVT KEY CHECK: Total Lines={len(key_lines)} | Total Length={len(private_key_pem)}")
-    if len(key_lines) < 2:
-        print("⚠️ WARNING: Private Key looks 'flattened' (1 line). Authentication will likely fail.")
-    else:
-        print("✅ Private Key format looks correct (Multiple lines detected).")
-    # ------------------------------------------------
-
     try:
-        config = kalshi_python.Configuration(host="https://api.elections.kalshi.com/trade-api/v2")
-        config.api_key_id = api_key_id
-        config.private_key_pem = private_key_pem
-        
-        api_client = kalshi_python.ApiClient(config)
-        portfolio_api = kalshi_python.PortfolioApi(api_client)
-        market_api = kalshi_python.MarketsApi(api_client)
-    except Exception as e:
-        print(f"❌ API Setup Error: {e}")
-        return
-
-    # 2. Risk Checks (Global)
-    print("💳 Checking Balance...")
-    try:
-        balance_data = portfolio_api.get_balance()
-        balance = balance_data.balance
+        client = KalshiClient()
+        balance = client.get_balance()
         print(f"✅ Balance: {balance}¢")
-        if balance < MIN_BALANCE_CENTS:
-            print(f"🛑 Balance Low: {balance}¢. Stopping.")
-            return
-        check_for_profit_taking(portfolio_api, market_api)
-    except Exception as e: 
-        print(f"❌ CRITICAL ERROR in Risk Checks: {e}")
+        if balance < MIN_BALANCE_CENTS: return
+    except Exception as e:
+        print(f"❌ Login Failed: {e}")
         return
 
-    # --- MAIN CITY LOOP ---
-    print(f"--- Starting Scan of {len(CITIES)} Cities ---")
-    
+    print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
-        print(f"\n🔎 Analyzing {city['name']} ({city['ticker']})...")
+        print(f"\n🔎 {city['name']}...")
+        om, nws = get_forecasts(city['lat'], city['lon'])
+        print(f"   Forecasts: OM {om}° | NWS {nws}°")
+        if not om or not nws: continue
         
-        om_temp = get_open_meteo_forecast(city['lat'], city['lon'])
-        nws_temp = get_nws_forecast(city['lat'], city['lon'])
+        safe_forecast = min(om, nws)
         
-        print(f"   Forecasts: OM {om_temp}° | NWS {nws_temp}°")
+        # We need to find active markets. Since we don't have a search endpoint in raw mode easily,
+        # we will iterate striking prices around the forecast.
+        # Efficient hack: Check tickers from Forecast - 5 to Forecast + 5
+        base_strike = int(safe_forecast)
+        potential_strikes = range(base_strike - 10, base_strike + 10)
         
-        if not om_temp or not nws_temp:
-            print("   Skipping (Data Missing)")
-            continue
-
-        safe_forecast = min(om_temp, nws_temp)
+        # Get active markets is hard without SDK search. 
+        # Actually, let's just use the known ticker series pattern.
+        # Example: KXHIGHTNOLA-26JAN24-T80
+        # This is hard to guess. 
+        # FALLBACK: We rely on the SERIES ticker? No, we need specific markets.
+        # For simplicity in 'Raw Mode', we might skip the complicated search 
+        # and just try to fetch the specific market if we knew the format.
+        # BUT: Kalshi V2 allows fetching markets by series_ticker.
         
         try:
-            markets_res = market_api.get_markets(series_ticker=city['ticker'], status="open")
-        except Exception as e:
-            print(f"   ⚠️ Market Fetch Error: {e}")
+            res = client._req("GET", f"/markets?series_ticker={city['ticker']}&status=open")
+            markets = res.json().get("markets", [])
+        except: 
+            print("   Failed to fetch markets.")
             continue
 
-        if not markets_res.markets:
-            print("   No active markets found.")
-            continue
+        if not markets: print("   No markets."); continue
 
-        for market in markets_res.markets:
+        for market in markets:
             try:
-                strike = float(market.ticker.split('-T')[-1])
-            except ValueError: continue
+                strike = float(market['ticker'].split('-T')[-1])
+            except: continue
 
             gap = safe_forecast - strike
+            if gap < 2.0: continue # Strict gap check
             
-            if gap >= 2.0:
-                if gap >= 5.0: qty, label = HIGH_CONF_COUNT, "HIGH"
-                elif gap >= 3.0: qty, label = MED_CONF_COUNT, "MED"
-                else: qty, label = LOW_CONF_COUNT, "LOW"
-                
+            qty = LOW_CONF_COUNT
+            if gap >= 5.0: qty = HIGH_CONF_COUNT
+            elif gap >= 3.0: qty = MED_CONF_COUNT
+            
+            # Check Balance/Positions
+            positions = client.get_positions()
+            curr_pos = next((p['position'] for p in positions if p['ticker'] == market['ticker']), 0)
+            qty = min(qty, MAX_TOTAL_POS - curr_pos)
+            if qty <= 0: continue
+            
+            # Check Price
+            ob = client.get_orderbook(market['ticker'])
+            if not ob or not ob['no']: continue
+            best_no_bid = ob['no'][0][0]
+            buy_yes_price = 100 - best_no_bid
+            
+            if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: continue
+            
+            if buy_yes_price < (75 - FEE_BUFFER):
+                print(f"   🚀 EXECUTE: Buying {qty}x {market['ticker']} @ {buy_yes_price}¢")
                 try:
-                    pos_res = portfolio_api.get_positions()
-                    curr_pos = next((p.position for p in pos_res.market_positions if p.ticker == market.ticker), 0)
-                except: curr_pos = 0
-                
-                qty = min(qty, MAX_TOTAL_POS - curr_pos)
-                if qty <= 0: continue
-
-                try:
-                    orderbook = market_api.get_market_orderbook(market.ticker)
-                    if not orderbook.orderbook.no: continue
-                    best_no_bid = orderbook.orderbook.no[0][0]
-                    buy_yes_price = 100 - best_no_bid
-                except: continue
-                
-                if buy_yes_price < MIN_PRICE or buy_yes_price > MAX_PRICE: continue
-
-                target_price_limit = 75 - FEE_BUFFER 
-                if buy_yes_price < target_price_limit:
-                    print(f"   🚀 EXECUTE: Buying {qty}x {market.ticker} @ {buy_yes_price}¢")
-                    try:
-                        portfolio_api.create_order(CreateOrderRequest(
-                            ticker=market.ticker, action="buy", side="yes",
-                            count=qty, type="limit", yes_price=buy_yes_price,
-                            client_order_id=str(uuid.uuid4())
-                        ))
-                        log_trade(market.ticker, safe_forecast, strike, gap, buy_yes_price, qty, "BUY")
-                        msg = (f"**Kalshi Bot Trade ({city['name']})** 🌎\n"
-                               f"Strategy: **{label}** (Gap {gap:.1f}°)\n"
-                               f"Bought: **{qty}x {market.ticker}** @ {buy_yes_price}¢\n"
-                               f"Forecasts: NWS {nws_temp}° / OM {om_temp}°")
-                        send_discord_alert(msg)
-                    except Exception as e:
-                        print(f"   Order Fail: {e}")
+                    resp = client.place_order(market['ticker'], "buy", "yes", qty, buy_yes_price)
+                    if resp.status_code == 201:
+                        log_trade(market['ticker'], safe_forecast, strike, gap, buy_yes_price, qty, "BUY")
+                        send_discord_alert(f"**Trade ({city['name']})**: Bought {qty}x {market['ticker']} @ {buy_yes_price}¢")
+                    else:
+                        print(f"   Order Failed: {resp.text}")
+                except Exception as e:
+                    print(f"   Order Error: {e}")
 
 if __name__ == "__main__":
     main()
