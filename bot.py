@@ -16,16 +16,16 @@ HOST = "https://api.elections.kalshi.com"
 # ✅ UPDATED TICKERS (Live 2026 Format)
 CITIES = [
     { "name": "NOLA", "lat": 29.99, "lon": -90.25, "ticker": "KXHIGHTNOLA" },
-    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHCHI" },  # Fixed (Removed T)
-    { "name": "MIAMI", "lat": 25.80, "lon": -80.29, "ticker": "KXHIGHMIA" },    # Fixed (Removed T)
+    { "name": "CHICAGO", "lat": 41.79, "lon": -87.75, "ticker": "KXHIGHCHI" },  
+    { "name": "MIAMI", "lat": 25.80, "lon": -80.29, "ticker": "KXHIGHMIA" },    
     { "name": "SEATTLE", "lat": 47.45, "lon": -122.31, "ticker": "KXHIGHTSEA" },
-    { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHAUS" }    # Fixed (Removed T)
+    { "name": "AUSTIN", "lat": 30.19, "lon": -97.67, "ticker": "KXHIGHAUS" }    
 ]
 
 # RISK SETTINGS
 MIN_BALANCE_CENTS = 500     
 MAX_TOTAL_POS = 20          
-PROFIT_TAKE_PRICE = 92      
+PROFIT_TAKE_PRICE = 92      # Sell automatically if bid is this high
 FEE_BUFFER = 3
 MIN_PRICE = 20
 MAX_PRICE = 80
@@ -128,11 +128,40 @@ def get_forecasts(lat, lon):
                 nws_temp = p['temperature']
                 break
     except: pass
-    
     return om_temp, nws_temp
 
+def check_profits(client):
+    print("--- 💰 Checking for Profit Opportunities ---")
+    try:
+        positions = client.get_positions()
+        for pos in positions:
+            if pos['position'] <= 0: continue
+            
+            # Check market price
+            ob = client.get_orderbook(pos['ticker'])
+            if not ob or not ob['yes']: continue
+            
+            # The 'yes' list is [ [price, qty], [price, qty] ... ]
+            # We want the HIGHEST price someone is willing to PAY (The Bid)
+            # Kalshi orderbook structure usually returns 'yes' side as [Bid, Ask]? 
+            # Actually raw API often gives Bids in descending order.
+            # Let's grab the best bid.
+            best_bid = ob['yes'][0][0]
+            
+            if best_bid >= PROFIT_TAKE_PRICE:
+                print(f"   🤑 PROFIT! Selling {pos['position']}x {pos['ticker']} @ {best_bid}¢")
+                try:
+                    resp = client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
+                    if resp.status_code == 201:
+                        log_trade(pos['ticker'], "PROFIT", "N/A", 0, best_bid, pos['position'], "SELL")
+                        send_discord_alert(f"💰 **Profit Taken!** Sold {pos['position']}x {pos['ticker']} @ **{best_bid}¢**")
+                except Exception as e:
+                    print(f"   Sell Error: {e}")
+    except Exception as e:
+        print(f"   Profit Check Error: {e}")
+
 def main():
-    print("🚀 Bot Starting (Verbose Mode)...")
+    print("🚀 Bot Starting (Full Auto Mode)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -140,10 +169,15 @@ def main():
         balance = client.get_balance()
         print(f"✅ Balance: {balance}¢")
         if balance < MIN_BALANCE_CENTS: return
+        
+        # 1. Run Profit Taker FIRST
+        check_profits(client)
+        
     except Exception as e:
         print(f"❌ Login Failed: {e}")
         return
 
+    # 2. Run Scanner
     print(f"--- Scanning {len(CITIES)} Cities ---")
     for city in CITIES:
         print(f"\n🔎 {city['name']}...")
@@ -171,11 +205,9 @@ def main():
 
             gap = safe_forecast - strike
             
-            # --- VERBOSE LOGGING START ---
             if gap < 2.0: 
-                print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small (Need 2.0+).")
+                print(f"   Skipping {market['ticker']}: Gap {gap:.1f}° is too small.")
                 continue 
-            # -----------------------------
             
             qty = LOW_CONF_COUNT
             if gap >= 5.0: qty = HIGH_CONF_COUNT
@@ -210,7 +242,7 @@ def main():
                 except Exception as e:
                     print(f"   ❌ Order Error: {e}")
             else:
-                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ too expensive (Target < {75-FEE_BUFFER}¢).")
+                print(f"   Skipping {market['ticker']}: Price {buy_yes_price}¢ too expensive.")
 
 if __name__ == "__main__":
     main()
