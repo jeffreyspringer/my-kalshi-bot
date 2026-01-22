@@ -160,7 +160,13 @@ def check_profits(client):
     except: pass
 
 def manage_risk(client, city_ticker, current_forecast):
-    """Sells OLD positions that no longer match the NEW forecast."""
+    """
+    Sells positions if the forecast moves against us, 
+    BUT applies 'Smart Exit' logic:
+    1. If Profitable -> SELL (Protect gains)
+    2. If NOT Profitable but High Probability (>50%) -> HOLD (Wait it out)
+    3. If NOT Profitable and Low Probability -> SELL (Stop loss)
+    """
     try:
         positions = client.get_positions()
         for pos in positions:
@@ -175,41 +181,45 @@ def manage_risk(client, city_ticker, current_forecast):
             # Distance from NEW forecast
             distance = abs(current_forecast - strike)
             
-            # --- LOGIC: WHEN TO BAIL OUT ---
+            # --- GET CURRENT MARKET DATA ---
+            ob = client.get_orderbook(pos['ticker'])
+            if not ob or not ob['yes']: continue
+            current_bid = ob['yes'][0][0] # What we can sell for right now
+            
+            # Try to get our entry price. If missing, assume 0 (Conservative)
+            entry_price = pos.get('avg_price', 0) 
+            
+            # --- RISK LOGIC ---
             should_sell = False
             reason = ""
             
-            # 1. We hold YES, but forecast moved away (Distance > 2.0)
-            # NOTE: We can't easily tell if we hold YES or NO from 'position' alone 
-            # (Kalshi nets them out). Positive position usually means we are Long Yes.
-            # If we bought "No", we are actually Short Yes (negative position) or 
-            # holding "No" contracts.
-            # Kalshi API V2: 'position' > 0 usually means Long Yes. 
-            # If we bought NO contracts, we hold "No" side. The API reports this differently.
-            # Assuming 'market_positions' returns positive integers and a 'side'?
-            # Actually, standard portfolio returns net position.
-            # CRITICAL: For this bot, we assume Position > 0 means we own the contract displayed.
-            
-            # SIMPLIFIED RISK LOGIC:
-            # If we own YES (Bullseye bet), but distance is now > 2.5, SELL.
-            if distance > 2.5:
-                should_sell = True
-                reason = f"Forecast moved! Dist is now {distance:.1f}°"
+            # Condition: Forecast has moved away (Risk is rising)
+            if distance > 2.0:
+                is_profitable = current_bid > entry_price
+                is_market_confident = current_bid > 50
+                
+                if is_profitable:
+                    should_sell = True
+                    reason = f"Forecast moved (Dist {distance:.1f}°) & Profitable ({current_bid}¢ > {entry_price}¢)"
+                
+                elif is_market_confident:
+                    print(f"   ✋ HOLDING {pos['ticker']}: Forecast moved (Dist {distance:.1f}°), but Market Confidence High ({current_bid}%).")
+                    should_sell = False
+                
+                else:
+                    should_sell = True
+                    reason = f"STOP LOSS: Forecast moved (Dist {distance:.1f}°) & Market Confidence Low ({current_bid}%)"
             
             if should_sell:
-                ob = client.get_orderbook(pos['ticker'])
-                if not ob or not ob['yes']: continue
-                best_bid = ob['yes'][0][0]
-                
-                print(f"   ⚠️ RISK ALERT: Selling {pos['ticker']} ({reason}) @ {best_bid}¢")
-                client.place_order(pos['ticker'], "sell", "yes", pos['position'], best_bid)
-                send_discord_alert(f"⚠️ **Risk Mgmt**: Dumped {pos['ticker']} @ {best_bid}¢. {reason}")
+                print(f"   ⚠️ RISK ALERT: Selling {pos['ticker']} ({reason})")
+                client.place_order(pos['ticker'], "sell", "yes", pos['position'], current_bid)
+                send_discord_alert(f"⚠️ **Risk Mgmt**: Dumped {pos['ticker']} @ {current_bid}¢. {reason}")
 
     except Exception as e:
         print(f"   Risk Check Error: {e}")
 
 def main():
-    print("🚀 Bot Starting (Active Manager V17)...")
+    print("🚀 Bot Starting (Smart Exit V18)...")
     if os.getenv("TRADING_ENABLED", "TRUE").upper() == "FALSE": return
     
     try:
@@ -231,7 +241,7 @@ def main():
             
         print(f"   🎯 Target: {safe_forecast:.1f}°")
         
-        # 1. CLEAN HOUSE FIRST (Sell bad bets based on new target)
+        # 1. SMART RISK MANAGEMENT
         manage_risk(client, city['ticker'], safe_forecast)
 
         try:
